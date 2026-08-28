@@ -1,0 +1,347 @@
+# Nova Studio
+
+Plateforme SaaS interne de generation de contenus IA pour une equipe, adossee a
+l'API [KIE.ai](https://kie.ai). Chaque collaborateur dispose de son propre
+espace et de ses propres donnees ; l'administrateur supervise l'ensemble de
+l'organisation.
+
+---
+
+## Sommaire
+
+- [Demarrage rapide](#demarrage-rapide)
+- [Architecture](#architecture)
+- [Ajouter un modele IA](#ajouter-un-modele-ia)
+- [Integration KIE.ai](#integration-kieai)
+- [Systeme de credits](#systeme-de-credits)
+- [Securite](#securite)
+- [Modele de donnees](#modele-de-donnees)
+- [API](#api)
+- [Tests](#tests)
+- [Deploiement](#deploiement)
+- [Points de branchement restants](#points-de-branchement-restants)
+
+---
+
+## Demarrage rapide
+
+Pre-requis : Node.js >= 20.11.
+
+```bash
+npm install
+cp .env.example .env      # renseigner APP_SECRET et KIE_API_KEY
+npm run build:shared
+npm run dev               # API sur :4000, interface sur :5173
+```
+
+Au premier demarrage, l'organisation, le catalogue de modeles et un compte
+administrateur sont crees automatiquement. Si `BOOTSTRAP_ADMIN_PASSWORD` n'est
+pas defini, un mot de passe aleatoire est genere et **affiche une seule fois**
+dans la console.
+
+Jeu de donnees de demonstration (collaborateurs + invitation en attente) :
+
+```bash
+npm run seed
+```
+
+### Variables d'environnement essentielles
+
+| Variable | Role |
+| --- | --- |
+| `APP_SECRET` | Secret maitre : sessions, chiffrement des cles API, URL signees. **Obligatoire en production** (32 caracteres minimum). |
+| `PUBLIC_BASE_URL` | URL publique de l'API. **Doit etre joignable depuis Internet** : KIE.ai telecharge les images de reference via des URL signees et appelle le webhook de callback. En local, utiliser un tunnel. |
+| `WEB_ORIGIN` | Origine(s) autorisee(s) du frontend (protection CSRF + CORS). |
+| `KIE_API_KEY` | Cle API par defaut. Elle peut aussi etre saisie depuis *Administration > Parametres*, auquel cas elle est chiffree en base et prioritaire. |
+| `COOKIE_SECURE` | `true` obligatoire derriere HTTPS. |
+
+La liste complete est documentee dans [`.env.example`](.env.example).
+
+---
+
+## Architecture
+
+```
+packages/shared   Contrat partage : types + definitions declaratives des modeles
+apps/api          Serveur Express + SQLite : auth, credits, KIE.ai, workflows
+apps/web          Interface React + Vite
+```
+
+Le decoupage du serveur suit les domaines metier :
+
+```
+apps/api/src/
+├── providers/kie/     Client HTTP KIE.ai (seul endroit qui parle au fournisseur)
+├── services/
+│   ├── auth            sessions, invitations, reinitialisation de mot de passe
+│   ├── users           comptes, roles, statuts, suppression
+│   ├── credits         grand livre (reservation, debit, remboursement)
+│   ├── models          catalogue, validation des definitions
+│   ├── paramValidation validation serveur + construction du payload provider
+│   ├── generations     cycle de vie d'une generation
+│   ├── workflows       execution sequentielle multi-etapes
+│   ├── gallery         selection personnelle de resultats
+│   ├── files           stockage, controle des uploads, URL signees
+│   ├── activity        journal des actions sensibles
+│   ├── analytics       agregats collaborateur et administrateur
+│   └── worker          reconciliation periodique des taches
+├── middleware/        authentification, roles, origine, erreurs, quotas
+└── routes/            surface HTTP (aucune logique metier)
+```
+
+**Regle structurante** : les routes valident et delèguent, les services portent
+la logique metier, le client KIE.ai est le seul a connaitre le fournisseur.
+Aucune cle secrete n'existe cote navigateur.
+
+---
+
+## Ajouter un modele IA
+
+C'est le point central de la conception. Un modele est une **donnee**, pas du
+code : sa definition pilote a la fois l'interface, la validation serveur, le
+payload envoye au fournisseur et le calcul des credits.
+
+Deux facons de proceder, sans rien reconstruire :
+
+1. **Depuis l'interface** — *Administration > Modeles IA > Ajouter un modele*.
+   La definition s'edite au format JSON et le modele est utilisable
+   immediatement.
+2. **Dans le catalogue par defaut** — ajouter une entree dans
+   [`packages/shared/src/models.ts`](packages/shared/src/models.ts). Elle sera
+   installee au demarrage suivant (ou via *Restaurer le catalogue*).
+
+```ts
+{
+  key: 'mon-modele',                    // cle interne stable
+  providerModel: 'fournisseur/modele',  // identifiant envoye a KIE.ai
+  name: 'Mon modele',
+  kind: 'image',                        // image | video | audio
+  outputs: { mode: 'fanout', min: 1, max: 4, default: 1 },
+  credits: { base: 5, perOutput: true },
+  params: [
+    { id: 'prompt', field: 'prompt', label: 'Prompt',
+      type: 'textarea', group: 'core', required: true, default: '', maxLength: 2000 },
+    { id: 'resolution', field: 'image_size', label: 'Resolution',
+      type: 'select', group: 'output', default: '2K',
+      options: [{ value: '1K', label: '1K' }, { value: '2K', label: '2K' }] },
+  ],
+}
+```
+
+Ce que la plateforme en deduit automatiquement :
+
+| Declaration | Effet |
+| --- | --- |
+| `params[].type` | Controle affiche (zone de texte, curseur, interrupteur, depot de fichiers, selection segmentee) |
+| `params[].field` | Nom du champ transmis dans `input` a KIE.ai |
+| `params[].group` | Placement dans l'interface (references / prompt / sortie / audio / avance) |
+| `params[].visibleWhen` | Affichage conditionnel — un parametre inapplicable n'est ni affiche ni transmis |
+| `credits` | Cout, calcule par la **meme fonction** cote serveur et cote interface |
+| `outputs` | Bornes du nombre de generations |
+
+Consequence directe : **un modele sans audio n'affiche aucun controle audio**,
+un modele sans duree n'affiche pas de curseur de duree. Aucun composant
+d'interface ne connait le nom d'un modele.
+
+Ajouter un nouveau *type* de controle (le seul cas necessitant du code) demande
+de completer deux endroits : le `switch` de
+[`ParamControl.tsx`](apps/web/src/components/generation/ParamControl.tsx) et
+celui de [`paramValidation.ts`](apps/api/src/services/paramValidation.ts).
+
+---
+
+## Integration KIE.ai
+
+Contrat utilise (API « Jobs » unifiee) :
+
+| Operation | Appel |
+| --- | --- |
+| Creer une tache | `POST /api/v1/jobs/createTask` — `{ model, input, callBackUrl }` |
+| Suivre une tache | `GET /api/v1/jobs/recordInfo?taskId=...` |
+| Authentification | `Authorization: Bearer <cle>` |
+
+Etats fournisseur pris en charge : `waiting`, `queuing`, `generating`,
+`success`, `fail` — normalises vers les etats internes de la plateforme.
+
+**Suivi des generations** : le webhook `callBackUrl` accelere la mise a jour,
+mais le sondage periodique reste la source de verite. Le corps du callback
+n'est jamais cru sur parole : il declenche une verification aupres de
+`recordInfo`. L'URL de callback est signee (HMAC) et liee a une generation
+precise, ce qui empeche un tiers de forcer un etat.
+
+**Fichiers de reference** : le fournisseur doit pouvoir les telecharger. Ils
+sont donc exposes par une URL publique **signee et expirante**
+(`/api/files/public/:id?expires=…&signature=…`), seul point d'entree non
+authentifie de l'application.
+
+**Resultats** : ils sont recopies vers le stockage local (`MIRROR_OUTPUTS`)
+pour que la galerie reste consultable apres expiration des URL du fournisseur.
+Si la copie echoue ou disparait, l'interface bascule automatiquement sur l'URL
+d'origine.
+
+**Erreurs** : chaque cas est distingue — cle absente ou refusee
+(`provider_not_configured`), delai depasse (`provider_timeout`), quota
+(`rate_limited`), refus du modele (`provider_error`). Le message affiche a
+l'utilisateur ne contient jamais de secret ni de trace technique ; le detail
+complet reste dans le journal serveur et dans `generations.error_detail_json`.
+
+---
+
+## Systeme de credits
+
+Toute variation de solde passe par une seule fonction transactionnelle
+(`applyLedgerEntry`), ce qui garantit que le solde et l'historique ne peuvent
+pas diverger.
+
+Cycle de vie d'une generation :
+
+1. **Reservation** — le cout est calcule **cote serveur** a partir de la
+   definition du modele, puis debite avant tout appel au fournisseur.
+2. **Blocage** — un solde insuffisant empeche le lancement, sauf si
+   l'administrateur a active le decouvert pour ce collaborateur.
+3. **Remboursement** — si la generation echoue, est annulee ou depasse le delai
+   maximum **sans avoir produit de resultat**, le montant est integralement
+   restitue. Le remboursement est idempotent : il ne peut pas etre rejoue.
+
+L'estimation affichee dans l'interface utilise la meme fonction pure que le
+serveur, mais n'a aucune autorite : le montant reellement debite est toujours
+recalcule cote serveur a partir des parametres valides.
+
+Chaque operation enregistre l'utilisateur, le modele, le type de generation,
+la date, les parametres, le cout, le statut et l'identifiant de la tache
+externe.
+
+---
+
+## Securite
+
+| Mesure | Mise en oeuvre |
+| --- | --- |
+| Sessions | Jetons opaques aleatoires, stockes **hashes** (SHA-256), revocables, expiration glissante, cookie `httpOnly` + `SameSite=Lax` |
+| Mots de passe | bcrypt (cout 12), politique minimale imposee, comparaison a cout constant sur les comptes inexistants |
+| Roles | Verifies **cote serveur** sur chaque route ; l'interface se contente de masquer les entrees de menu |
+| Isolation | `organization_id` + `user_id` filtres explicitement dans chaque requete ; un collaborateur ne peut pas elargir sa portee via un parametre d'URL |
+| Validation | Tout parametre est valide contre la definition du modele ; les parametres inconnus sont **rejetes** |
+| Uploads | Liste blanche de types MIME, taille bornee, **verification de la signature binaire** du fichier |
+| CSRF | `SameSite=Lax` + controle d'origine sur toute requete mutante |
+| Bruteforce | Quotas sur connexion, inscription, reinitialisation et lancement de generation |
+| Secrets | Cle API chiffree AES-256-GCM, jamais renvoyee au client (seuls les 4 derniers caracteres) |
+| Journalisation | Toute action sensible est tracee (auteur, cible, metadonnees, IP) |
+| Suppressions | Confirmation explicite par recopie de l'adresse e-mail du compte |
+
+Les messages d'erreur sont volontairement identiques en cas d'echec de
+connexion, quelle qu'en soit la cause, afin de ne pas reveler l'existence d'un
+compte.
+
+---
+
+## Modele de donnees
+
+SQLite en mode WAL, avec integrite referentielle activee
+(`PRAGMA foreign_keys = ON`) et suppressions en cascade.
+
+```
+Organization ─┬─ User ──┬─ CreditBalance
+              │         ├─ CreditTransaction
+              │         ├─ Generation ──┬─ GenerationAsset ── GalleryItem
+              │         │               └─ (File)
+              │         ├─ Workflow ── WorkflowStep
+              │         │      └─ WorkflowRun ── WorkflowStepRun
+              │         └─ File
+              ├─ Model            (definition JSON pilotant l'interface)
+              ├─ Invitation
+              ├─ ActivityLog
+              └─ ApiConfiguration (cle chiffree)
+```
+
+Le schema complet est dans
+[`apps/api/src/db/schema.sql`](apps/api/src/db/schema.sql), commente table par
+table. Le schema est multi-organisation, meme si un deploiement n'en heberge
+qu'une : aucune migration ne sera necessaire pour evoluer.
+
+---
+
+## API
+
+Toutes les routes sont prefixees par `/api`.
+
+| Domaine | Routes principales |
+| --- | --- |
+| Authentification | `POST /auth/login`, `/auth/logout`, `/auth/register`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/change-password`, `GET /auth/session`, `/auth/invitation` |
+| Espace personnel | `GET /me`, `PATCH /me`, `GET /me/overview`, `/me/credits`, `/me/sessions` |
+| Modeles | `GET /models`, `GET /models/:key`, `POST /models/:key/estimate` |
+| Fichiers | `POST /files`, `GET /files/:id/content`, `GET /files/public/:id` (signee), `DELETE /files/:id` |
+| Generations | `POST /generations`, `GET /generations`, `GET /generations/:id`, `POST /generations/:id/cancel`, `DELETE /generations/:id` |
+| Galerie | `GET /gallery`, `POST /gallery`, `PATCH /gallery/:id`, `DELETE /gallery/:id` |
+| Workflows | `GET|POST /workflows`, `PUT|DELETE /workflows/:id`, `POST /workflows/:id/run`, `/duplicate`, `GET /workflows/runs` |
+| Administration | `/admin/overview`, `/admin/users`, `/admin/credits`, `/admin/activity`, `/admin/invitations`, `/admin/models`, `/admin/settings`, `/admin/api-configuration` |
+| Webhook | `POST /webhooks/kie/:generationId` (signee) |
+
+Les erreurs suivent une enveloppe unique et typee :
+
+```json
+{ "error": { "code": "insufficient_credits", "message": "…", "fields": {}, "requestId": "req_…" } }
+```
+
+---
+
+## Tests
+
+```bash
+npm test          # 22 tests d'integration (API reelle + fournisseur simule)
+npm run typecheck # verification TypeScript des trois paquets
+```
+
+La suite couvre l'authentification et les messages d'erreur, le controle
+d'acces par role, la protection d'origine, l'inscription par invitation (et le
+rejeu de jeton), la validation des parametres, le cycle complet d'une
+generation reussie, le remboursement en cas d'echec, le blocage sur solde
+insuffisant, l'isolation stricte entre collaborateurs, la galerie, les
+workflows multi-etapes, la desactivation et la suppression de comptes,
+l'ajout d'un modele a chaud et la non-divulgation de la cle API.
+
+Le fournisseur est simule par un serveur HTTP local reproduisant le contrat
+KIE.ai (`apps/api/test/mockKie.ts`) : aucun credit reel n'est consomme.
+
+---
+
+## Deploiement
+
+```bash
+npm run build     # shared, puis API, puis interface
+NODE_ENV=production SERVE_WEB=true npm start
+```
+
+Avec `SERVE_WEB=true`, l'API sert egalement l'interface compilee : un seul
+processus et un seul port a exposer.
+
+En production, verifier imperativement :
+
+- `APP_SECRET` defini et conserve (le changer invalide sessions et cles chiffrees) ;
+- `COOKIE_SECURE=true` derriere HTTPS ;
+- `PUBLIC_BASE_URL` joignable depuis Internet ;
+- sauvegarde de `DATA_DIR` (base) et `STORAGE_DIR` (fichiers).
+
+---
+
+## Points de branchement restants
+
+Ces elements dependent de services externes non disponibles dans cet
+environnement. L'interface et l'abstraction sont en place ; seul le connecteur
+reste a brancher.
+
+1. **Envoi d'e-mails** — invitations et reinitialisations de mot de passe
+   generent un lien fonctionnel, actuellement remis a l'administrateur (ou
+   journalise) au lieu d'etre envoye. Point de branchement :
+   `apps/api/src/routes/auth.ts` (`forgot-password`) et
+   `apps/api/src/services/auth.ts` (`createInvitation`).
+
+2. **Identifiants de modeles a confirmer** — les modeles marques
+   « A verifier » dans *Administration > Modeles IA* utilisent des noms de
+   champs (`duration`, `resolution`, `generate_audio`, identifiants Suno /
+   Kling / ElevenLabs) qui doivent etre confirmes sur la page de documentation
+   du modele avec la cle API de l'organisation. Les endpoints `createTask` /
+   `recordInfo`, l'authentification et les champs `prompt`, `image_urls`,
+   `aspect_ratio`, `output_format` sont conformes a la documentation publique.
+   **Aucun redeploiement n'est necessaire** pour corriger un identifiant :
+   la definition s'edite depuis l'espace d'administration.

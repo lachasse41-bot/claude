@@ -46,6 +46,7 @@ function toDto(row: GalleryRow): GalleryItem {
       kind: row.a_kind as 'input' | 'output',
       role: row.a_role,
       url: row.a_file_id ? `/api/files/${row.a_file_id}/content` : row.a_url,
+      remoteUrl: row.a_url || null,
       mimeType: row.a_mime,
       sizeBytes: row.a_size,
       width: row.a_width,

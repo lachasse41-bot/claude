@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { Router } from 'express';
 import multer from 'multer';
 import { env } from '../env.js';
-import { AppError, badRequest } from '../lib/errors.js';
+import { AppError, badRequest, notFound } from '../lib/errors.js';
 import { asyncRoute } from '../middleware/error.js';
 import { currentUser, requireAuth } from '../middleware/context.js';
 import {
@@ -41,7 +41,7 @@ filesRouter.get('/public/:fileId', asyncRoute(async (req, res) => {
     String(req.query.signature ?? ''),
   );
   const absolute = absolutePath(row);
-  if (!fs.existsSync(absolute)) throw badRequest('Fichier indisponible.');
+  if (!fs.existsSync(absolute)) throw notFound("Ce fichier n'est plus disponible sur le serveur.");
   res.setHeader('Content-Type', row.mime_type);
   res.setHeader('Cache-Control', 'private, max-age=300');
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -78,7 +78,9 @@ filesRouter.post('/', upload.array('files', 10), asyncRoute(async (req, res) => 
 filesRouter.get('/:fileId/content', asyncRoute(async (req, res) => {
   const row = getAccessibleFile(req.params.fileId, viewerOf(req));
   const absolute = absolutePath(row);
-  if (!fs.existsSync(absolute)) throw badRequest('Fichier indisponible.');
+  // La copie locale peut manquer (stockage purge, recopie echouee) : le client
+  // bascule alors sur l'URL du fournisseur exposee par `remoteUrl`.
+  if (!fs.existsSync(absolute)) throw notFound("Ce fichier n'est plus disponible sur le serveur.");
   res.setHeader('Content-Type', row.mime_type);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'private, max-age=3600');

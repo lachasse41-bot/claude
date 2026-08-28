@@ -104,7 +104,13 @@ export interface GenerationAsset {
   generationId: string;
   kind: 'input' | 'output';
   role: string;
+  /** URL servie par la plateforme (copie locale) ou, a defaut, URL du provider. */
   url: string;
+  /**
+   * URL d'origine chez le fournisseur, conservee comme secours si la copie
+   * locale est indisponible. Peut etre vide et peut expirer.
+   */
+  remoteUrl: string | null;
   mimeType: string | null;
   sizeBytes: number | null;
   width: number | null;

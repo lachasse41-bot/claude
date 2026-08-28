@@ -58,6 +58,7 @@ function assetToDto(row: AssetRow): GenerationAsset {
     // Un asset recopie localement est servi par l'API (URL stable et protegee) ;
     // sinon on renvoie l'URL provider.
     url: row.file_id ? `/api/files/${row.file_id}/content` : row.url,
+    remoteUrl: row.url || null,
     mimeType: row.mime_type,
     sizeBytes: row.size_bytes,
     width: row.width,
