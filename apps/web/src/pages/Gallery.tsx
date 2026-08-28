@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { Search, Star } from 'lucide-react';
-import type { GalleryItem, ModelKind } from '@nova/shared';
-import { ApiError, api } from '../lib/api';
-import { useGallery, useInvalidateWorkspace, useModels } from '../lib/queries';
+import type { AdminOverview, GalleryItem, ModelKind } from '@nova/shared';
+import { ApiError } from '../lib/api';
+import { useGallery, useInvalidateWorkspace, useModels, useQuery } from '../lib/queries';
+import { api } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import {
   Badge, Button, Card, ConfirmDialog, EmptyState, ErrorState, Input, PageHeader,
@@ -25,6 +26,8 @@ export function GalleryPage() {
   const [modelKey, setModelKey] = useState('');
   const [sort, setSort] = useState('recent');
   const [scope, setScope] = useState<'mine' | 'all'>('mine');
+  /** Filtre par collaborateur, reserve a l'administrateur. */
+  const [userFilter, setUserFilter] = useState('');
   const [selected, setSelected] = useState<GalleryItem | null>(null);
   const [pendingDelete, setPendingDelete] = useState<GalleryItem | null>(null);
 
@@ -37,8 +40,16 @@ export function GalleryPage() {
     kind: kind === 'all' ? undefined : kind,
     modelKey: modelKey || undefined,
     sort,
-    userId: isAdmin && scope === 'all' ? 'all' : undefined,
+    userId: isAdmin && scope === 'all' ? (userFilter || 'all') : undefined,
     pageSize: 48,
+  });
+
+  // Liste des collaborateurs, chargee uniquement pour l'administrateur en
+  // mode « toute l'organisation ».
+  const organizationUsers = useQuery({
+    queryKey: ['admin-overview', 30],
+    enabled: isAdmin && scope === 'all',
+    queryFn: () => api.get<AdminOverview>('/admin/overview?days=30'),
   });
 
   async function remove(item: GalleryItem) {
@@ -106,6 +117,19 @@ export function GalleryPage() {
               <option key={model.key} value={model.key}>{model.name}</option>
             ))}
           </Select>
+          {isAdmin && scope === 'all' ? (
+            <Select
+              value={userFilter}
+              onChange={(event) => setUserFilter(event.target.value)}
+              className="w-auto min-w-[180px]"
+              aria-label="Filtrer par collaborateur"
+            >
+              <option value="">Tous les collaborateurs</option>
+              {(organizationUsers.data?.byUser ?? []).map((row) => (
+                <option key={row.userId} value={row.userId}>{row.name}</option>
+              ))}
+            </Select>
+          ) : null}
           <Select
             value={sort}
             onChange={(event) => setSort(event.target.value)}

@@ -1,8 +1,10 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowDown, Copy, Link2, Play, Plus, Trash2, Workflow as WorkflowIcon, X,
 } from 'lucide-react';
-import type { ModelSummary, Workflow, WorkflowInputBinding, WorkflowStep } from '@nova/shared';
+import type {
+  FilesParamSpec, ModelSummary, Workflow, WorkflowInputBinding, WorkflowStep,
+} from '@nova/shared';
 import { computeCreditCost, defaultParamValues, isParamVisible } from '@nova/shared';
 import { ApiError, api } from '../lib/api';
 import { useInvalidateWorkspace, useModels, useWorkflowRun, useWorkflowRuns, useWorkflows } from '../lib/queries';
@@ -12,6 +14,7 @@ import {
   InlineNotice, Modal, PageHeader, ProgressBar, Select, Skeleton, Textarea, useToast,
 } from '../components/ui';
 import { ParamControl } from '../components/generation/ParamControl';
+import { FilePicker } from '../components/generation/FilePicker';
 import { StateBadge } from '../components/generation/GenerationCard';
 import { formatRelative } from '../lib/format';
 
@@ -351,6 +354,141 @@ function WorkflowEditor({
   );
 }
 
+
+/**
+ * Dialogue de lancement.
+ * N'apparait que si le workflow attend quelque chose au demarrage : des
+ * fichiers (etape liee a « Fichiers fournis au lancement ») ou un prompt
+ * global reference par {{input.prompt}}.
+ */
+function LaunchDialog({
+  workflow, models, onClose, onLaunched,
+}: {
+  workflow: Workflow | null;
+  models: ModelSummary[];
+  onClose: () => void;
+  onLaunched: (runId: string) => void;
+}) {
+  const toast = useToast();
+  const invalidate = useInvalidateWorkspace();
+  const { refresh } = useAuth();
+  const [uploads, setUploads] = useState<Record<string, string[]>>({});
+  const [prompt, setPrompt] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { setUploads({}); setPrompt(''); }, [workflow?.id]);
+
+  // Parametres fichiers a alimenter au lancement, dedupliques par identifiant.
+  const requiredUploads = useMemo(() => {
+    if (!workflow) return [];
+    const found = new Map<string, { spec: FilesParamSpec; stepName: string }>();
+    for (const step of workflow.steps) {
+      const model = models.find((m) => m.key === step.modelKey);
+      if (!model) continue;
+      for (const binding of step.inputs) {
+        if (binding.source !== 'upload' || found.has(binding.paramId)) continue;
+        const spec = model.params.find((p) => p.id === binding.paramId);
+        if (spec?.type === 'files') found.set(binding.paramId, { spec, stepName: step.name });
+      }
+    }
+    return [...found.values()];
+  }, [workflow, models]);
+
+  const needsPrompt = Boolean(workflow?.steps.some((step) => step.prompt.includes('{{input.prompt}}')));
+
+  const missing = requiredUploads.filter(
+    ({ spec }) => (uploads[spec.id]?.length ?? 0) < spec.minItems,
+  );
+  const canLaunch = missing.length === 0 && (!needsPrompt || prompt.trim().length > 0);
+
+  async function launch() {
+    if (!workflow) return;
+    setBusy(true);
+    try {
+      const response = await api.post<{ run: { id: string } }>(`/workflows/${workflow.id}/run`, {
+        uploads,
+        prompt: prompt.trim() || undefined,
+      });
+      toast.success('Execution lancee', 'Les etapes s enchainent automatiquement.');
+      invalidate(['workflow-runs', 'generations', 'credits']);
+      void refresh();
+      onLaunched(response.run.id);
+      onClose();
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? err.title : 'Lancement impossible',
+        err instanceof ApiError ? err.message : undefined,
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={Boolean(workflow)}
+      onClose={onClose}
+      title="Lancer le workflow"
+      description={workflow?.name}
+      footer={
+        <>
+          <span className="mr-auto text-[13px] text-secondary-fg">
+            Cout estime :{' '}
+            <span className="font-semibold text-[var(--text-primary)]">
+              {workflow?.estimatedCredits ?? 0} credits
+            </span>
+          </span>
+          <Button variant="ghost" onClick={onClose}>Annuler</Button>
+          <Button loading={busy} disabled={!canLaunch} icon={<Play className="size-4" />} onClick={launch}>
+            Executer
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-5">
+        {needsPrompt ? (
+          <Field
+            label="Prompt de lancement"
+            required
+            hint="Substitue a {{input.prompt}} dans les etapes qui le referencent."
+          >
+            <Textarea
+              value={prompt}
+              rows={3}
+              onChange={(event) => setPrompt(event.target.value)}
+              placeholder="Decrivez ce que doit produire cette execution..."
+            />
+          </Field>
+        ) : null}
+
+        {requiredUploads.map(({ spec, stepName }) => (
+          <Field
+            key={spec.id}
+            label={`${spec.label} — ${stepName}`}
+            required={spec.minItems > 0}
+            hint={spec.help}
+          >
+            <FilePicker
+              value={uploads[spec.id] ?? []}
+              onChange={(ids) => setUploads((current) => ({ ...current, [spec.id]: ids }))}
+              accept={spec.accept}
+              minItems={spec.minItems}
+              maxItems={spec.maxItems}
+            />
+          </Field>
+        ))}
+
+        {!needsPrompt && requiredUploads.length === 0 ? (
+          <InlineNotice tone="info">
+            Ce workflow n'attend aucune entree : les {workflow?.steps.length} etapes seront
+            executees telles qu'elles sont configurees.
+          </InlineNotice>
+        ) : null}
+      </div>
+    </Modal>
+  );
+}
+
 /** Suivi detaille d'une execution, etape par etape. */
 function RunMonitor({ runId, onClose }: { runId: string | null; onClose: () => void }) {
   const { data: run, isLoading } = useWorkflowRun(runId);
@@ -462,33 +600,13 @@ export function WorkflowsPage() {
   const { data: models } = useModels();
   const { data: workflows, isLoading, error, refetch } = useWorkflows();
   const { data: runs } = useWorkflowRuns();
-  const { refresh } = useAuth();
-  const invalidate = useInvalidateWorkspace();
   const toast = useToast();
 
   const [editing, setEditing] = useState<Workflow | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [runId, setRunId] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Workflow | null>(null);
-  const [launching, setLaunching] = useState<string | null>(null);
-
-  async function launch(workflow: Workflow) {
-    setLaunching(workflow.id);
-    try {
-      const response = await api.post<{ run: { id: string } }>(`/workflows/${workflow.id}/run`, {});
-      toast.success('Execution lancee', 'Les etapes s enchainent automatiquement.');
-      setRunId(response.run.id);
-      invalidate(['workflow-runs', 'generations', 'credits']);
-      void refresh();
-    } catch (err) {
-      toast.error(
-        err instanceof ApiError ? err.title : 'Lancement impossible',
-        err instanceof ApiError ? err.message : undefined,
-      );
-    } finally {
-      setLaunching(null);
-    }
-  }
+  const [launchTarget, setLaunchTarget] = useState<Workflow | null>(null);
 
   async function duplicate(workflow: Workflow) {
     try {
@@ -590,8 +708,7 @@ export function WorkflowsPage() {
                 <Button
                   size="sm"
                   icon={<Play className="size-3.5" />}
-                  loading={launching === workflow.id}
-                  onClick={() => launch(workflow)}
+                  onClick={() => setLaunchTarget(workflow)}
                 >
                   Executer
                 </Button>
@@ -638,6 +755,13 @@ export function WorkflowsPage() {
           onSaved={() => void refetch()}
         />
       ) : null}
+
+      <LaunchDialog
+        workflow={launchTarget}
+        models={models ?? []}
+        onClose={() => setLaunchTarget(null)}
+        onLaunched={setRunId}
+      />
 
       <RunMonitor runId={runId} onClose={() => setRunId(null)} />
 

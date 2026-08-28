@@ -370,11 +370,20 @@ export function AdminUsersPage() {
   );
 }
 
+/**
+ * Deux facons d'ouvrir un acces :
+ *  - « Inviter » : le collaborateur choisit lui-meme son mot de passe (par defaut) ;
+ *  - « Creer le compte » : l'administrateur definit un mot de passe provisoire,
+ *    utile lorsque le lien d'invitation ne peut pas etre transmis.
+ */
 function InviteModal({
   open, onClose, onCreated,
 }: { open: boolean; onClose: () => void; onCreated: () => void }) {
   const toast = useToast();
+  const [mode, setMode] = useState<'invite' | 'direct'>('invite');
   const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
   const [role, setRole] = useState<Role>('collaborator');
   const [credits, setCredits] = useState(500);
   const [fields, setFields] = useState<Record<string, string>>({});
@@ -385,6 +394,13 @@ function InviteModal({
     setBusy(true);
     setFields({});
     try {
+      if (mode === 'direct') {
+        await api.post('/admin/users', { email, name, password, role, initialCredits: credits });
+        toast.success('Compte cree', `${name} peut se connecter des maintenant.`);
+        onCreated();
+        close();
+        return;
+      }
       const response = await api.post<{ invitation: Invitation }>('/admin/invitations', {
         email, role, initialCredits: credits,
       });
@@ -402,23 +418,34 @@ function InviteModal({
   }
 
   function close() {
-    setEmail(''); setInviteUrl(null); setFields({}); setCredits(500);
+    setEmail(''); setName(''); setPassword(''); setInviteUrl(null);
+    setFields({}); setCredits(500); setMode('invite');
     onClose();
   }
+
+  const canSubmit =
+    email.trim().length > 0 &&
+    (mode === 'invite' || (name.trim().length > 1 && password.length >= 10));
 
   return (
     <Modal
       open={open}
       onClose={close}
-      title="Inviter un collaborateur"
-      description="Le compte ne pourra etre cree qu'avec ce lien d'invitation."
+      title="Ajouter un collaborateur"
+      description={
+        mode === 'invite'
+          ? "Le compte ne pourra etre cree qu'avec ce lien d'invitation."
+          : 'Le compte est cree immediatement avec un mot de passe provisoire.'
+      }
       footer={
         inviteUrl ? (
           <Button onClick={close}>Termine</Button>
         ) : (
           <>
             <Button variant="ghost" onClick={close}>Annuler</Button>
-            <Button loading={busy} disabled={!email.trim()} onClick={submit}>Creer l'invitation</Button>
+            <Button loading={busy} disabled={!canSubmit} onClick={submit}>
+              {mode === 'invite' ? "Creer l'invitation" : 'Creer le compte'}
+            </Button>
           </>
         )
       }
@@ -449,12 +476,44 @@ function InviteModal({
         </div>
       ) : (
         <div className="space-y-4">
+          <SegmentedControl
+            value={mode}
+            onChange={(value) => { setMode(value as 'invite' | 'direct'); setFields({}); }}
+            options={[
+              { value: 'invite', label: 'Inviter par lien' },
+              { value: 'direct', label: 'Creer le compte' },
+            ]}
+          />
+
           <Field label="Adresse e-mail" required error={fields.email} htmlFor="invite-email">
             <Input
               id="invite-email" type="email" value={email}
               onChange={(e) => setEmail(e.target.value)} placeholder="collaborateur@entreprise.com"
             />
           </Field>
+          {mode === 'direct' ? (
+            <>
+              <Field label="Nom complet" required error={fields.name} htmlFor="invite-name">
+                <Input
+                  id="invite-name" value={name}
+                  onChange={(e) => setName(e.target.value)} placeholder="Prenom Nom"
+                />
+              </Field>
+              <Field
+                label="Mot de passe provisoire"
+                required
+                error={fields.password}
+                hint="Au moins 10 caracteres dont une lettre et un chiffre. Le collaborateur pourra le changer depuis son profil."
+                htmlFor="invite-password"
+              >
+                <Input
+                  id="invite-password" type="text" value={password} autoComplete="off"
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </Field>
+            </>
+          ) : null}
+
           <Field label="Role" hint="Un administrateur peut superviser toute l'organisation.">
             <Select value={role} onChange={(e) => setRole(e.target.value as Role)}>
               <option value="collaborator">Collaborateur</option>
