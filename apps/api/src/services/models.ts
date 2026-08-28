@@ -1,5 +1,6 @@
 import {
   MODEL_CATALOG,
+  TRANSPORTS,
   computeCreditCost,
   defaultParamValues,
   isParamVisible,
@@ -124,6 +125,7 @@ export interface ModelUpsertInput {
   name: string;
   description?: string;
   kind: ModelDefinition['kind'];
+  transport?: ModelDefinition['transport'];
   family?: string;
   providerModel: string;
   docsUrl?: string;
@@ -150,7 +152,7 @@ export function upsertModel(organizationId: string, input: ModelUpsertInput): Mo
     description: input.description ?? '',
     kind: input.kind,
     family: input.family ?? '',
-    transport: 'jobs',
+    transport: input.transport ?? 'jobs',
     docsUrl: input.docsUrl ?? '',
     timeoutSeconds: input.timeoutSeconds ?? 600,
     outputs: input.outputs,
@@ -170,7 +172,7 @@ export function upsertModel(organizationId: string, input: ModelUpsertInput): Mo
     kind: input.kind,
     family: definition.family,
     providerModel: input.providerModel,
-    transport: 'jobs',
+    transport: definition.transport,
     docsUrl: definition.docsUrl,
     timeoutSeconds: definition.timeoutSeconds,
     definition: JSON.stringify(definition),
@@ -239,6 +241,12 @@ export function validateDefinition(input: ModelUpsertInput): void {
   if (!input.name?.trim()) fields.name = 'Nom obligatoire.';
   if (!input.providerModel?.trim()) fields.providerModel = 'Identifiant du modele provider obligatoire.';
   if (!['image', 'video', 'audio'].includes(input.kind)) fields.kind = 'Type invalide.';
+  if (input.transport && !Object.keys(TRANSPORTS).includes(input.transport)) {
+    fields.transport = `Transport inconnu. Valeurs possibles : ${Object.keys(TRANSPORTS).join(', ')}.`;
+  }
+  if (input.outputs?.mode === 'provider' && !input.outputs.field) {
+    fields.outputs = "Le mode `provider` exige le nom du champ transmettant le nombre de sorties.";
+  }
   if (!Array.isArray(input.params) || input.params.length === 0) {
     fields.params = 'Au moins un parametre est requis.';
   }

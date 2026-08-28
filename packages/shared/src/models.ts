@@ -14,18 +14,73 @@
 
 import type { ModelKind } from './types.js';
 
+/**
+ * Transports provider.
+ * ---------------------------------------------------------------------------
+ * KIE.ai n'expose pas un seul point d'entree : l'API « Jobs » couvre le
+ * catalogue de modeles (« market »), tandis que Veo et Suno disposent de leurs
+ * propres endpoints avec un corps de requete a plat. Un transport decrit donc
+ * ou envoyer la demande, ou lire son etat, et comment emballer les parametres.
+ *
+ * Ajouter un transport = ajouter une entree ici + la referencer depuis un
+ * modele. Le reste de la chaine (validation, credits, suivi, workflows) est
+ * inchange.
+ */
+export type TransportKey = 'jobs' | 'veo' | 'suno';
+
+export interface TransportSpec {
+  label: string;
+  createPath: string;
+  statusPath: string;
+  /**
+   * `input` : { model, input: { ...params } }  — API Jobs
+   * `flat`  : { model, ...params }             — endpoints dedies (Veo, Suno)
+   */
+  payloadStyle: 'input' | 'flat';
+  /** Champs constants ajoutes au corps de la requete. */
+  constantBody?: Record<string, unknown>;
+  docsUrl: string;
+}
+
+export const TRANSPORTS: Record<TransportKey, TransportSpec> = {
+  jobs: {
+    label: 'API Jobs (catalogue market)',
+    createPath: '/api/v1/jobs/createTask',
+    statusPath: '/api/v1/jobs/recordInfo',
+    payloadStyle: 'input',
+    docsUrl: 'https://docs.kie.ai/market/common/get-task-detail',
+  },
+  veo: {
+    label: 'Endpoint dedie Veo',
+    createPath: '/api/v1/veo/generate',
+    statusPath: '/api/v1/veo/record-info',
+    payloadStyle: 'flat',
+    docsUrl: 'https://docs.kie.ai/veo3-api/generate-veo-3-video',
+  },
+  suno: {
+    label: 'Endpoint dedie Suno',
+    createPath: '/api/v1/generate',
+    statusPath: '/api/v1/generate/record-info',
+    payloadStyle: 'flat',
+    // Mode simple : le prompt decrit la piste, Suno gere le reste.
+    constantBody: { customMode: false },
+    docsUrl: 'https://docs.kie.ai/suno-api/generate-music',
+  },
+};
+
 export type ParamGroup = 'reference' | 'core' | 'output' | 'audio' | 'advanced';
 
 export type ParamValue = string | number | boolean | string[] | null;
 
 /**
- * Indique si le nom de champ provider a ete confirme dans la documentation
- * publique KIE.ai accessible au moment de l'implementation.
- *  - 'verified'   : nom de champ constate dans la doc / des exemples officiels
- *  - 'unverified' : nom de champ plausible a CONFIRMER sur la page de doc du
- *                   modele (`docsUrl`) avant mise en production reelle.
- *                   L'interface d'administration permet de le corriger sans
- *                   redeploiement.
+ * Statut de verification d'un nom de champ provider.
+ *  - 'verified'   : nom de champ constate dans le contrat public du
+ *                   fournisseur (endpoints, enums et types releves sur les
+ *                   integrations de reference).
+ *  - 'unverified' : nom de champ a CONFIRMER sur la page de doc du modele
+ *                   (`docsUrl`) avant mise en production. C'est la valeur par
+ *                   defaut des modeles ajoutes depuis l'administration.
+ * Dans les deux cas, la correction se fait sans redeploiement.
  */
 export type FieldVerification = 'verified' | 'unverified';
 
@@ -135,12 +190,8 @@ export interface ModelDefinition {
   description: string;
   kind: ModelKind;
   family: string;
-  /**
-   * Style d'appel provider. Un seul style est implemente aujourd'hui
-   * (`jobs` = /api/v1/jobs/createTask + /api/v1/jobs/recordInfo).
-   * Le champ existe pour brancher d'autres styles sans refonte.
-   */
-  transport: 'jobs';
+  /** Transport provider a utiliser (voir `TRANSPORTS`). */
+  transport: TransportKey;
   docsUrl: string;
   /** Duree max acceptable d'une tache avant passage en `failed` (secondes). */
   timeoutSeconds: number;
@@ -170,18 +221,70 @@ const promptParam = (placeholder: string, required = true): TextParamSpec => ({
   placeholder,
 });
 
-const aspectRatioParam = (values: string[], def: string): SelectParamSpec => ({
-  id: 'aspect_ratio',
-  field: 'aspect_ratio',
+/** Ratios acceptes par les modeles Gemini/Nano Banana. */
+const NANO_BANANA_RATIOS = [
+  '1:1', '9:16', '16:9', '3:4', '4:3', '3:2', '2:3', '5:4', '4:5', '21:9', 'auto',
+] as const;
+
+/**
+ * Ratio d image. Attention : sur le catalogue « market », le champ transmis
+ * s appelle `image_size` et non `aspect_ratio` — l ecart entre le libelle
+ * affiche et le nom du champ provider est precisement ce que la definition
+ * declarative permet d absorber.
+ */
+const imageSizeParam = (values: readonly string[], def: string): SelectParamSpec => ({
+  id: 'image_size',
+  field: 'image_size',
   fieldVerification: 'verified',
   label: 'Ratio',
   group: 'output',
   type: 'select',
   default: def,
-  options: values.map((v) => ({ value: v, label: v })),
+  options: values.map((v) => ({
+    value: v,
+    label: v === 'auto' ? 'Auto' : v,
+    ...(v === 'auto' ? { description: 'Choisi par le modele' } : {}),
+  })),
 });
 
-const outputFormatParam = (def = 'png'): SelectParamSpec => ({
+/** Seedream nomme ses formats au lieu d utiliser des ratios numeriques. */
+const seedreamFormatParam = (): SelectParamSpec => ({
+  id: 'image_size',
+  field: 'image_size',
+  fieldVerification: 'verified',
+  label: 'Format',
+  group: 'output',
+  type: 'select',
+  default: 'landscape_16_9',
+  options: [
+    { value: 'square', label: 'Carre', description: '1:1' },
+    { value: 'square_hd', label: 'Carre HD', description: '1:1 haute definition' },
+    { value: 'portrait_4_3', label: 'Portrait 3:4' },
+    { value: 'portrait_3_2', label: 'Portrait 2:3' },
+    { value: 'portrait_16_9', label: 'Portrait 9:16' },
+    { value: 'landscape_4_3', label: 'Paysage 4:3' },
+    { value: 'landscape_3_2', label: 'Paysage 3:2' },
+    { value: 'landscape_16_9', label: 'Paysage 16:9' },
+    { value: 'landscape_21_9', label: 'Panoramique 21:9' },
+  ],
+});
+
+const seedreamResolutionParam = (): SelectParamSpec => ({
+  id: 'image_resolution',
+  field: 'image_resolution',
+  fieldVerification: 'verified',
+  label: 'Resolution',
+  group: 'output',
+  type: 'select',
+  default: '2K',
+  options: [
+    { value: '1K', label: '1K', description: 'Brouillon rapide' },
+    { value: '2K', label: '2K', description: 'Usage courant' },
+    { value: '4K', label: '4K', description: 'Impression / grand format' },
+  ],
+});
+
+const outputFormatParam = (values: string[], def: string): SelectParamSpec => ({
   id: 'output_format',
   field: 'output_format',
   fieldVerification: 'verified',
@@ -189,10 +292,57 @@ const outputFormatParam = (def = 'png'): SelectParamSpec => ({
   group: 'output',
   type: 'select',
   default: def,
+  options: values.map((v) => ({
+    value: v,
+    label: v.toUpperCase(),
+    description: v === 'png' ? 'Sans perte' : 'Plus leger',
+  })),
+});
+
+/**
+ * Duree Kling. Le fournisseur est strict sur le type : la valeur doit etre
+ * transmise en chaine de caracteres, d ou un `select` plutot qu un curseur.
+ */
+const klingDurationParam = (): SelectParamSpec => ({
+  id: 'duration',
+  field: 'duration',
+  fieldVerification: 'verified',
+  label: 'Duree',
+  group: 'output',
+  type: 'select',
+  default: '5',
   options: [
-    { value: 'png', label: 'PNG', description: 'Sans perte' },
-    { value: 'jpeg', label: 'JPEG', description: 'Plus leger' },
+    { value: '5', label: '5 s' },
+    { value: '10', label: '10 s' },
   ],
+});
+
+const klingCfgParam = (): NumberParamSpec => ({
+  id: 'cfg_scale',
+  field: 'cfg_scale',
+  fieldVerification: 'verified',
+  label: 'Adherence au prompt',
+  help: "Valeur basse : plus de liberte creative. Valeur haute : suit le prompt de pres.",
+  group: 'advanced',
+  type: 'number',
+  min: 0,
+  max: 1,
+  step: 0.1,
+  default: 0.5,
+});
+
+const negativePromptParam = (): TextParamSpec => ({
+  id: 'negative_prompt',
+  field: 'negative_prompt',
+  fieldVerification: 'verified',
+  label: 'A eviter',
+  help: "Elements que le modele doit ecarter.",
+  group: 'advanced',
+  type: 'text',
+  default: '',
+  maxLength: 500,
+  placeholder: 'flou, texte illisible, mains deformees',
+  omitWhenValueIn: [''],
 });
 
 const referenceImagesParam = (min: number, max: number): FilesParamSpec => ({
@@ -200,7 +350,7 @@ const referenceImagesParam = (min: number, max: number): FilesParamSpec => ({
   field: 'image_urls',
   fieldVerification: 'verified',
   label: 'Images de reference',
-  help: 'Les fichiers sont heberges par la plateforme puis transmis au modele sous forme d URL.',
+  help: "Les fichiers sont heberges par la plateforme puis transmis au modele sous forme d URL.",
   group: 'reference',
   type: 'files',
   accept: ['image/png', 'image/jpeg', 'image/webp'],
@@ -230,7 +380,7 @@ export const MODEL_CATALOG: ModelDefinition[] = [
     providerModel: 'google/nano-banana',
     providerModelVerification: 'verified',
     name: 'Nano Banana',
-    description: 'Generation d images a partir d un prompt. Rapide et economique.',
+    description: "Generation d images a partir d un prompt. Rapide et economique.",
     kind: 'image',
     family: 'Google',
     transport: 'jobs',
@@ -240,8 +390,9 @@ export const MODEL_CATALOG: ModelDefinition[] = [
     credits: { base: 4, perOutput: true },
     params: [
       promptParam('Un studio photo minimaliste, lumiere douce, produit centre...'),
-      aspectRatioParam(['1:1', '3:4', '4:3', '9:16', '16:9'], '1:1'),
-      outputFormatParam('png'),
+      // Attention : chez ce modele le ratio se transmet via `image_size`.
+      imageSizeParam(NANO_BANANA_RATIOS, '1:1'),
+      outputFormatParam(['png', 'jpeg'], 'png'),
     ],
     enabledByDefault: true,
     sortOrder: 10,
@@ -251,7 +402,7 @@ export const MODEL_CATALOG: ModelDefinition[] = [
     providerModel: 'google/nano-banana-edit',
     providerModelVerification: 'verified',
     name: 'Nano Banana Edit',
-    description: 'Edition et composition d images a partir de references.',
+    description: "Edition et composition d images a partir de references.",
     kind: 'image',
     family: 'Google',
     transport: 'jobs',
@@ -262,179 +413,202 @@ export const MODEL_CATALOG: ModelDefinition[] = [
     params: [
       referenceImagesParam(1, 5),
       promptParam('Remplace l arriere-plan par un decor de plage au coucher du soleil...'),
-      aspectRatioParam(['1:1', '3:4', '4:3', '9:16', '16:9'], '1:1'),
-      outputFormatParam('png'),
+      imageSizeParam(NANO_BANANA_RATIOS, '1:1'),
+      outputFormatParam(['png', 'jpeg'], 'png'),
     ],
+    integrationNotes:
+      "Le nombre maximum d images de reference (5) est une limite fixee par la plateforme, non documentee par le fournisseur.",
     enabledByDefault: true,
     sortOrder: 20,
   },
   {
     key: 'seedream-v4',
-    providerModel: 'bytedance/seedream-v4',
-    providerModelVerification: 'unverified',
-    name: 'Seedream v4',
-    description: 'Images haute definition, jusqu a 4K, avec references optionnelles.',
+    providerModel: 'bytedance/seedream-v4-text-to-image',
+    providerModelVerification: 'verified',
+    name: 'Seedream 4.0',
+    description: "Images haute definition jusqu a 4K, plusieurs variantes en une seule tache.",
     kind: 'image',
     family: 'ByteDance',
     transport: 'jobs',
-    docsUrl: 'https://docs.kie.ai/market/bytedance/seedream-v4',
+    docsUrl: 'https://docs.kie.ai/market/bytedance/seedream-v4-text-to-image',
     timeoutSeconds: 420,
-    outputs: { mode: 'fanout', min: 1, max: 4, default: 1 },
+    // Ce modele produit lui-meme plusieurs images : une seule tache suffit.
+    outputs: { mode: 'provider', field: 'max_images', min: 1, max: 6, default: 1 },
     credits: {
       base: 8,
       perOutput: true,
-      multipliers: [{ paramId: 'image_size', map: { '1K': 1, '2K': 1.6, '4K': 2.6 }, fallback: 1 }],
+      multipliers: [
+        { paramId: 'image_resolution', map: { '1K': 1, '2K': 1.6, '4K': 2.6 }, fallback: 1 },
+      ],
     },
     params: [
-      referenceImagesParam(0, 4),
       promptParam('Affiche publicitaire, typographie soignee, style editorial...'),
-      aspectRatioParam(['1:1', '3:4', '4:3', '9:16', '16:9', '21:9'], '16:9'),
-      {
-        id: 'image_size',
-        field: 'image_size',
-        fieldVerification: 'unverified',
-        label: 'Resolution',
-        group: 'output',
-        type: 'select',
-        default: '2K',
-        options: [
-          { value: '1K', label: '1K', description: 'Brouillon rapide' },
-          { value: '2K', label: '2K', description: 'Usage courant' },
-          { value: '4K', label: '4K', description: 'Impression / grand format' },
-        ],
-      },
-      outputFormatParam('png'),
+      seedreamFormatParam(),
+      seedreamResolutionParam(),
     ],
-    integrationNotes:
-      'Confirmer `bytedance/seedream-v4` et le champ `image_size` sur la page de doc avant usage reel.',
     enabledByDefault: true,
     sortOrder: 30,
   },
   {
-    key: 'veo3-fast',
-    providerModel: 'google/veo3-fast',
-    providerModelVerification: 'unverified',
-    name: 'Veo 3 Fast',
-    description: 'Video courte a partir d un prompt, avec piste audio optionnelle.',
+    key: 'seedream-v4-edit',
+    providerModel: 'bytedance/seedream-v4-edit',
+    providerModelVerification: 'verified',
+    name: 'Seedream 4.0 Edit',
+    description: "Retouche haute definition a partir d images de reference.",
+    kind: 'image',
+    family: 'ByteDance',
+    transport: 'jobs',
+    docsUrl: 'https://docs.kie.ai/market/bytedance/seedream-v4-edit',
+    timeoutSeconds: 420,
+    outputs: { mode: 'provider', field: 'max_images', min: 1, max: 6, default: 1 },
+    credits: {
+      base: 10,
+      perOutput: true,
+      multipliers: [
+        { paramId: 'image_resolution', map: { '1K': 1, '2K': 1.6, '4K': 2.6 }, fallback: 1 },
+      ],
+    },
+    params: [
+      referenceImagesParam(1, 5),
+      promptParam('Harmonise la lumiere et remplace le fond par un studio neutre...'),
+      seedreamFormatParam(),
+      seedreamResolutionParam(),
+    ],
+    enabledByDefault: true,
+    sortOrder: 35,
+  },
+  {
+    key: 'veo-3-fast',
+    // Sur l'endpoint Veo, `model` prend une valeur courte (veo3, veo3_fast,
+    // veo3_lite) et non un identifiant de catalogue.
+    providerModel: 'veo3_fast',
+    providerModelVerification: 'verified',
+    name: 'Veo 3.1 Fast',
+    description: "Video courte generee a partir d un prompt, avec bande son.",
     kind: 'video',
     family: 'Google',
-    transport: 'jobs',
+    transport: 'veo',
     docsUrl: 'https://docs.kie.ai/veo3-api/generate-veo-3-video',
     timeoutSeconds: 900,
     outputs: { mode: 'fanout', min: 1, max: 4, default: 1 },
-    credits: {
-      base: 20,
-      perOutput: true,
-      perUnit: { paramId: 'duration', creditsPerUnit: 6 },
-      multipliers: [{ paramId: 'resolution', map: { '720p': 1, '1080p': 1.7 }, fallback: 1 }],
-    },
+    credits: { base: 40, perOutput: true },
     params: [
       {
         ...referenceImagesParam(0, 1),
+        field: 'imageUrls',
         label: 'Image de depart (optionnelle)',
-        help: 'Fournir une image pour une generation image-vers-video.',
+        help: "Fournir une image pour une generation image-vers-video.",
+        required: false,
       },
       promptParam('Travelling lent sur une ville la nuit, neons, pluie fine...'),
-      aspectRatioParam(['16:9', '9:16', '1:1'], '16:9'),
       {
-        id: 'resolution',
-        field: 'resolution',
-        fieldVerification: 'unverified',
-        label: 'Resolution',
+        id: 'aspect_ratio',
+        field: 'aspect_ratio',
+        fieldVerification: 'verified',
+        label: 'Ratio',
         group: 'output',
         type: 'select',
-        default: '720p',
+        default: '16:9',
         options: [
-          { value: '720p', label: '720p' },
-          { value: '1080p', label: '1080p' },
+          { value: '16:9', label: '16:9', description: 'Paysage' },
+          { value: '9:16', label: '9:16', description: 'Portrait' },
+          { value: 'Auto', label: 'Auto', description: 'Choisi par le modele' },
         ],
       },
       {
-        id: 'duration',
-        field: 'duration',
-        fieldVerification: 'unverified',
-        label: 'Duree',
-        group: 'output',
-        type: 'number',
-        min: 4,
-        max: 8,
-        step: 1,
-        default: 8,
-        unit: 's',
-      },
-      {
-        id: 'generate_audio',
-        field: 'generate_audio',
-        fieldVerification: 'unverified',
-        label: 'Generer la bande son',
-        help: 'Ajoute une piste audio synchronisee generee par le modele.',
-        group: 'audio',
+        id: 'enable_translation',
+        field: 'enableTranslation',
+        fieldVerification: 'verified',
+        label: 'Traduire automatiquement le prompt',
+        help: "Le modele est optimise pour l anglais ; la traduction est appliquee en amont.",
+        group: 'advanced',
         type: 'boolean',
         default: true,
       },
-      {
-        id: 'audio_prompt',
-        field: 'audio_prompt',
-        fieldVerification: 'unverified',
-        label: 'Direction audio',
-        group: 'audio',
-        type: 'text',
-        default: '',
-        maxLength: 500,
-        placeholder: 'Ambiance urbaine, basse profonde, pas de dialogue',
-        visibleWhen: { paramId: 'generate_audio', equals: [true] },
-        omitWhenValueIn: [''],
-      },
     ],
     integrationNotes:
-      'Verifier l identifiant du modele et les champs duree/resolution/audio sur la page Veo 3.',
+      "Veo genere sa bande son et fixe la duree du plan : ni la duree ni le mixage audio ne sont parametrables sur cet endpoint.",
     enabledByDefault: true,
     sortOrder: 40,
   },
   {
+    key: 'kling-t2v',
+    providerModel: 'kling/v2-1-master-text-to-video',
+    providerModelVerification: 'verified',
+    name: 'Kling 2.1 Master',
+    description: "Video a partir d un prompt, duree et adherence reglables.",
+    kind: 'video',
+    family: 'Kling',
+    transport: 'jobs',
+    docsUrl: 'https://docs.kie.ai/market/kling/text-to-video',
+    timeoutSeconds: 900,
+    outputs: { mode: 'fanout', min: 1, max: 2, default: 1 },
+    credits: {
+      base: 25,
+      perOutput: true,
+      multipliers: [{ paramId: 'duration', map: { '5': 1, '10': 2 }, fallback: 1 }],
+    },
+    params: [
+      promptParam('Un drone survole une cote rocheuse au lever du jour...'),
+      {
+        id: 'aspect_ratio',
+        field: 'aspect_ratio',
+        fieldVerification: 'verified',
+        label: 'Ratio',
+        group: 'output',
+        type: 'select',
+        default: '16:9',
+        options: [
+          { value: '16:9', label: '16:9' },
+          { value: '9:16', label: '9:16' },
+          { value: '1:1', label: '1:1' },
+        ],
+      },
+      klingDurationParam(),
+      klingCfgParam(),
+      negativePromptParam(),
+    ],
+    enabledByDefault: true,
+    sortOrder: 45,
+  },
+  {
     key: 'kling-i2v',
-    providerModel: 'kling/v2-image-to-video',
-    providerModelVerification: 'unverified',
-    name: 'Kling Image-to-Video',
-    description: 'Anime une image de reference en sequence video.',
+    providerModel: 'kling/v2-1-master-image-to-video',
+    providerModelVerification: 'verified',
+    name: 'Kling 2.1 Master I2V',
+    description: "Anime une image de reference en sequence video.",
     kind: 'video',
     family: 'Kling',
     transport: 'jobs',
     docsUrl: 'https://docs.kie.ai/market/kling/image-to-video',
     timeoutSeconds: 900,
     outputs: { mode: 'fanout', min: 1, max: 2, default: 1 },
-    credits: { base: 25, perOutput: true, perUnit: { paramId: 'duration', creditsPerUnit: 5 } },
+    credits: {
+      base: 25,
+      perOutput: true,
+      multipliers: [{ paramId: 'duration', map: { '5': 1, '10': 2 }, fallback: 1 }],
+    },
     params: [
-      { ...referenceImagesParam(1, 1), label: 'Image source', asArray: false, field: 'image_url' },
+      // Image unique : le champ attend une URL, pas un tableau.
+      { ...referenceImagesParam(1, 1), field: 'image_url', label: 'Image source', asArray: false },
       promptParam('Le personnage tourne lentement la tete vers la camera...'),
-      aspectRatioParam(['16:9', '9:16', '1:1'], '16:9'),
-      {
-        id: 'duration',
-        field: 'duration',
-        fieldVerification: 'unverified',
-        label: 'Duree',
-        group: 'output',
-        type: 'number',
-        min: 5,
-        max: 10,
-        step: 5,
-        default: 5,
-        unit: 's',
-      },
+      klingDurationParam(),
+      klingCfgParam(),
+      negativePromptParam(),
     ],
-    integrationNotes: 'Confirmer l identifiant Kling et le champ `image_url` avant usage reel.',
     enabledByDefault: true,
     sortOrder: 50,
   },
   {
     key: 'suno-music',
-    providerModel: 'suno/v5',
-    providerModelVerification: 'unverified',
+    // Sur l'endpoint Suno, `model` designe la version du moteur.
+    providerModel: 'V5',
+    providerModelVerification: 'verified',
     name: 'Suno Music',
-    description: 'Composition musicale a partir d une description de style.',
+    description: "Composition musicale complete a partir d une description.",
     kind: 'audio',
     family: 'Suno',
-    transport: 'jobs',
+    transport: 'suno',
     docsUrl: 'https://docs.kie.ai/suno-api/generate-music',
     timeoutSeconds: 600,
     outputs: { mode: 'fanout', min: 1, max: 2, default: 1 },
@@ -442,9 +616,21 @@ export const MODEL_CATALOG: ModelDefinition[] = [
     params: [
       promptParam('Pop electronique lumineuse, tempo 110, voix feminine...'),
       {
+        id: 'title',
+        field: 'title',
+        fieldVerification: 'verified',
+        label: 'Titre',
+        group: 'audio',
+        type: 'text',
+        default: '',
+        maxLength: 100,
+        placeholder: 'Lumiere du matin',
+        omitWhenValueIn: [''],
+      },
+      {
         id: 'style',
         field: 'style',
-        fieldVerification: 'unverified',
+        fieldVerification: 'verified',
         label: 'Style musical',
         group: 'audio',
         type: 'text',
@@ -456,39 +642,26 @@ export const MODEL_CATALOG: ModelDefinition[] = [
       {
         id: 'instrumental',
         field: 'instrumental',
-        fieldVerification: 'unverified',
+        fieldVerification: 'verified',
         label: 'Instrumental (sans voix)',
         group: 'audio',
         type: 'boolean',
-        default: false,
-      },
-      {
-        id: 'lyrics',
-        field: 'lyrics',
-        fieldVerification: 'unverified',
-        label: 'Paroles',
-        group: 'audio',
-        type: 'textarea',
-        default: '',
-        maxLength: 3000,
-        visibleWhen: { paramId: 'instrumental', equals: [false] },
-        omitWhenValueIn: [''],
+        default: true,
       },
     ],
-    integrationNotes: 'Confirmer l identifiant Suno et les champs paroles/instrumental.',
     enabledByDefault: true,
     sortOrder: 60,
   },
   {
     key: 'tts-voice',
-    providerModel: 'elevenlabs/text-to-speech',
-    providerModelVerification: 'unverified',
+    providerModel: 'elevenlabs/text-to-speech-multilingual-v2',
+    providerModelVerification: 'verified',
     name: 'Voix off',
-    description: 'Synthese vocale a partir d un texte.',
+    description: "Synthese vocale multilingue a partir d un texte.",
     kind: 'audio',
     family: 'ElevenLabs',
     transport: 'jobs',
-    docsUrl: 'https://docs.kie.ai/market/elevenlabs/text-to-speech',
+    docsUrl: 'https://docs.kie.ai/market/elevenlabs/text-to-speech-multilingual-v2',
     timeoutSeconds: 300,
     outputs: { mode: 'fanout', min: 1, max: 4, default: 1 },
     credits: { base: 5, perOutput: true },
@@ -496,34 +669,50 @@ export const MODEL_CATALOG: ModelDefinition[] = [
       { ...promptParam('Texte a lire par la voix de synthese...'), field: 'text', label: 'Texte' },
       {
         id: 'voice',
-        field: 'voice_id',
-        fieldVerification: 'unverified',
+        field: 'voice',
+        fieldVerification: 'verified',
         label: 'Voix',
+        help: "Identifiants de voix ElevenLabs. Le fournisseur refuse la demande si aucune voix n est fournie.",
         group: 'audio',
         type: 'select',
-        default: 'female-warm',
+        default: '5l5f8iK3YPeGga21rQIX',
         options: [
-          { value: 'female-warm', label: 'Feminine chaleureuse' },
-          { value: 'male-deep', label: 'Masculine grave' },
-          { value: 'neutral-clear', label: 'Neutre claire' },
+          { value: '5l5f8iK3YPeGga21rQIX', label: 'Adeline', description: 'Feminine, conversationnelle' },
+          { value: 'EkK5I93UQWFDigLMpZcX', label: 'James', description: 'Grave, engageante' },
+          { value: '1SM7GgM6IMuvQlz2BwM3', label: 'Mark', description: 'Detendue, naturelle' },
+          { value: 'Z3R5wn05IrDiVCyEkUrK', label: 'Arabella', description: 'Emotive' },
+          { value: 'BZgkqPqms7Kj9ulSkVzn', label: 'Eve', description: 'Energique' },
         ],
       },
       {
         id: 'speed',
         field: 'speed',
-        fieldVerification: 'unverified',
+        fieldVerification: 'verified',
         label: 'Vitesse',
         group: 'audio',
         type: 'number',
-        min: 0.5,
-        max: 1.5,
-        step: 0.1,
+        min: 0.7,
+        max: 1.2,
+        step: 0.05,
         default: 1,
         unit: 'x',
       },
+      {
+        id: 'output_format',
+        field: 'output_format',
+        fieldVerification: 'verified',
+        label: 'Format audio',
+        group: 'output',
+        type: 'select',
+        default: 'mp3_44100_128',
+        options: [
+          { value: 'mp3_44100_128', label: 'MP3 128 kbps' },
+          { value: 'mp3_44100_192', label: 'MP3 192 kbps' },
+        ],
+      },
     ],
     integrationNotes:
-      'Les identifiants de voix doivent etre remplaces par ceux du compte KIE.ai de l organisation.',
+      "Les identifiants de voix peuvent etre remplaces par ceux du compte ElevenLabs de l organisation.",
     enabledByDefault: true,
     sortOrder: 70,
   },

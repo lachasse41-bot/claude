@@ -1,5 +1,6 @@
 import {
   computeCreditCost,
+  type TransportKey,
   type Generation,
   type GenerationAsset,
   type ModelSummary,
@@ -15,7 +16,7 @@ import { signPayload } from '../lib/crypto.js';
 import * as kie from '../providers/kie/client.js';
 import { applyLedgerEntry, assertCanSpend } from './credits.js';
 import { deleteFileById, mirrorRemoteFile, resolveFileUrls, toStoredFile, getFileRow } from './files.js';
-import { getEnabledModel } from './models.js';
+import { getEnabledModel, getModelByKey } from './models.js';
 import { getSettings } from './organizations.js';
 import { buildProviderInput, validateParams } from './paramValidation.js';
 
@@ -206,8 +207,22 @@ export function createGeneration(input: CreateGenerationInput): CreateGeneration
   }
 
   const providerInput = buildProviderInput(model, resolved.values, fileUrls);
-  const unitCost = computeCreditCost(model, resolved.values, 1);
-  const totalCost = unitCost * requested;
+
+  /*
+   * Deux facons d'obtenir plusieurs sorties :
+   *  - `provider` : le modele en produit plusieurs dans une seule tache
+   *    (ex. `max_images` chez Seedream) — une seule ligne, un seul appel ;
+   *  - `fanout`   : une tache par sortie, valable pour tous les modeles.
+   */
+  const providerSideOutputs = model.outputs.mode === 'provider' && Boolean(model.outputs.field);
+  if (providerSideOutputs) {
+    providerInput[model.outputs.field!] = requested;
+  }
+  const taskCount = providerSideOutputs ? 1 : requested;
+  const unitCost = providerSideOutputs
+    ? computeCreditCost(model, resolved.values, requested)
+    : computeCreditCost(model, resolved.values, 1);
+  const totalCost = unitCost * taskCount;
 
   assertCanSpend(viewer.userId, totalCost);
 
@@ -217,7 +232,7 @@ export function createGeneration(input: CreateGenerationInput): CreateGeneration
 
   const created = tx(() => {
     const ids: string[] = [];
-    for (let index = 0; index < requested; index += 1) {
+    for (let index = 0; index < taskCount; index += 1) {
       const generationId = id('gen');
       db.prepare(`
         INSERT INTO generations (
@@ -245,7 +260,7 @@ export function createGeneration(input: CreateGenerationInput): CreateGeneration
         creditCost: unitCost,
         batchId,
         batchIndex: index,
-        batchSize: requested,
+        batchSize: taskCount,
         workflowRunId: input.workflow?.runId ?? null,
         workflowStepId: input.workflow?.stepId ?? null,
         nextPollAt: now,
@@ -348,6 +363,7 @@ export async function submitToProvider(generationId: string, preloaded?: ModelSu
     const model = preloaded ?? getEnabledModel(row.organization_id, row.model_key);
     const task = await kie.createTask({
       organizationId: row.organization_id,
+      transport: model.transport,
       model: model.providerModel,
       payload,
       callbackUrl: callbackUrlFor(generationId),
@@ -445,6 +461,19 @@ export function cancelGeneration(generationId: string, viewer: Viewer): Generati
 /* Reconciliation avec le provider                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Transport a utiliser pour suivre une generation.
+ * Si le modele a ete supprime du catalogue depuis, on retombe sur l'API Jobs,
+ * qui couvre la majorite des modeles.
+ */
+function transportOf(row: GenerationRow): TransportKey {
+  try {
+    return getModelByKey(row.organization_id, row.model_key).transport;
+  } catch {
+    return 'jobs';
+  }
+}
+
 const PROGRESS_BY_STATE: Record<kie.ProviderState, number> = {
   waiting: 15, queuing: 25, generating: 60, success: 100, fail: 100,
 };
@@ -485,7 +514,9 @@ export async function syncGeneration(generationId: string): Promise<void> {
 
   let record: kie.TaskRecord;
   try {
-    record = await kie.getTask(row.organization_id, row.external_task_id);
+    // Le transport est resolu depuis le modele : les endpoints dedies (Veo,
+    // Suno) n'ont pas la meme URL de suivi que l'API Jobs.
+    record = await kie.getTask(row.organization_id, row.external_task_id, transportOf(row));
   } catch (error) {
     const attempts = row.attempt_count + 1;
     db.prepare('UPDATE generations SET attempt_count = ?, next_poll_at = ?, updated_at = ? WHERE id = ?')

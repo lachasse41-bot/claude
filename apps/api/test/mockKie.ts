@@ -40,14 +40,26 @@ export async function startMockKie(pollsBeforeSuccess = 1): Promise<MockKie> {
         return res.end(JSON.stringify({ code: 401, msg: 'unauthorized' }));
       }
 
-      if (url.pathname === '/api/v1/jobs/createTask') {
+      // Les trois transports de creation de tache exposes par KIE.ai.
+      const CREATE_PATHS = ['/api/v1/jobs/createTask', '/api/v1/veo/generate', '/api/v1/generate'];
+      if (CREATE_PATHS.includes(url.pathname)) {
         const taskId = `task_${tasks.size + 1}_${state.failNext ? 'fail' : 'ok'}`;
-        tasks.set(taskId, { polls: 0, model: body?.model, input: body?.input });
+        tasks.set(taskId, {
+          polls: 0,
+          model: body?.model,
+          // Les endpoints dedies passent les parametres a plat.
+          input: url.pathname === '/api/v1/jobs/createTask' ? body?.input : body,
+        });
         state.failNext = false;
         return res.end(JSON.stringify({ code: 200, msg: 'success', data: { taskId } }));
       }
 
-      if (url.pathname === '/api/v1/jobs/recordInfo') {
+      const STATUS_PATHS = [
+        '/api/v1/jobs/recordInfo',
+        '/api/v1/veo/record-info',
+        '/api/v1/generate/record-info',
+      ];
+      if (STATUS_PATHS.includes(url.pathname)) {
         const taskId = url.searchParams.get('taskId') ?? '';
         const task = tasks.get(taskId);
         if (!task) {
@@ -64,13 +76,23 @@ export async function startMockKie(pollsBeforeSuccess = 1): Promise<MockKie> {
             data: { taskId, state: 'fail', failCode: '422', failMsg: 'prompt refuse par le modele' },
           }));
         }
+        // `max_images` : le modele renvoie autant de resultats que demande.
+        const count = Number((task.input as Record<string, unknown> | undefined)?.max_images ?? 1);
+        const urls = Array.from(
+          { length: Number.isFinite(count) && count > 0 ? count : 1 },
+          (_, i) => `http://127.0.0.1:${port}/output/${taskId}-${i}.png`,
+        );
+        // L'endpoint Veo imbrique son resultat sous `response`, les autres
+        // renvoient une chaine JSON sous `resultJson` : les deux sont testes.
+        if (url.pathname === '/api/v1/veo/record-info') {
+          return res.end(JSON.stringify({
+            code: 200,
+            data: { taskId, successFlag: 1, response: { resultUrls: urls } },
+          }));
+        }
         return res.end(JSON.stringify({
           code: 200,
-          data: {
-            taskId,
-            state: 'success',
-            resultJson: JSON.stringify({ resultUrls: [`http://127.0.0.1:${port}/output/${taskId}.png`] }),
-          },
+          data: { taskId, state: 'success', resultJson: JSON.stringify({ resultUrls: urls }) },
         }));
       }
 

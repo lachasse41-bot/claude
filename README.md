@@ -152,16 +152,32 @@ celui de [`paramValidation.ts`](apps/api/src/services/paramValidation.ts).
 
 ## Integration KIE.ai
 
-Contrat utilise (API « Jobs » unifiee) :
+KIE.ai n'expose pas un point d'entree unique. Trois **transports** sont
+implementes, declares par chaque modele et decrits dans
+[`TRANSPORTS`](packages/shared/src/models.ts) :
 
-| Operation | Appel |
-| --- | --- |
-| Creer une tache | `POST /api/v1/jobs/createTask` — `{ model, input, callBackUrl }` |
-| Suivre une tache | `GET /api/v1/jobs/recordInfo?taskId=...` |
-| Authentification | `Authorization: Bearer <cle>` |
+| Transport | Creation | Suivi | Corps |
+| --- | --- | --- | --- |
+| `jobs` | `POST /api/v1/jobs/createTask` | `GET /api/v1/jobs/recordInfo` | `{ model, input: { … } }` |
+| `veo` | `POST /api/v1/veo/generate` | `GET /api/v1/veo/record-info` | `{ model, …params }` |
+| `suno` | `POST /api/v1/generate` | `GET /api/v1/generate/record-info` | `{ model, customMode, …params }` |
 
-Etats fournisseur pris en charge : `waiting`, `queuing`, `generating`,
-`success`, `fail` — normalises vers les etats internes de la plateforme.
+Authentification : `Authorization: Bearer <cle>` dans tous les cas.
+Etats pris en charge : `waiting`, `queuing`, `generating`, `success`, `fail`,
+ainsi que le `successFlag` numerique des endpoints dedies — tous normalises
+vers les etats internes. Le resultat est lu depuis `resultJson` (chaine JSON)
+ou `response` (objet) selon l'endpoint.
+
+Ajouter un transport = une entree dans `TRANSPORTS` + le referencer depuis un
+modele. Validation, credits, suivi et workflows restent inchanges.
+
+### Nombre de sorties
+
+Deux strategies, declarees par `outputs.mode` :
+
+- `provider` — le modele produit plusieurs resultats dans **une seule tache**
+  (ex. `max_images` chez Seedream) : une generation, un appel, N resultats ;
+- `fanout` — une tache par sortie. Toujours valable, quel que soit le modele.
 
 **Suivi des generations** : le webhook `callBackUrl` accelere la mise a jour,
 mais le sondage periodique reste la source de verite. Le corps du callback
@@ -288,7 +304,7 @@ Les erreurs suivent une enveloppe unique et typee :
 ## Tests
 
 ```bash
-npm test          # 24 tests d'integration (API reelle + fournisseur simule)
+npm test          # 31 tests d'integration (API reelle + fournisseur simule)
 npm run typecheck # verification TypeScript des trois paquets
 ```
 
@@ -298,9 +314,10 @@ rejeu de jeton), la validation des parametres, le cycle complet d'une
 generation reussie, le remboursement en cas d'echec, le blocage sur solde
 insuffisant, l'isolation stricte entre collaborateurs, la galerie, les
 workflows multi-etapes, la desactivation et la suppression de comptes,
-l'ajout d'un modele a chaud, la non-divulgation de la cle API, ainsi que deux
-cas de robustesse : desactivation d'un modele pendant une generation en vol et
-definition de modele corrompue en base.
+l'ajout d'un modele a chaud, la non-divulgation de la cle API, les trois
+transports provider, les sorties multiples en une seule tache, les parametres
+conditionnels, ainsi que deux cas de robustesse : desactivation d'un modele
+pendant une generation en vol et definition de modele corrompue en base.
 
 Le fournisseur est simule par un serveur HTTP local reproduisant le contrat
 KIE.ai (`apps/api/test/mockKie.ts`) : aucun credit reel n'est consomme.
@@ -338,12 +355,27 @@ reste a brancher.
    `apps/api/src/routes/auth.ts` (`forgot-password`) et
    `apps/api/src/services/auth.ts` (`createInvitation`).
 
-2. **Identifiants de modeles a confirmer** — les modeles marques
-   « A verifier » dans *Administration > Modeles IA* utilisent des noms de
-   champs (`duration`, `resolution`, `generate_audio`, identifiants Suno /
-   Kling / ElevenLabs) qui doivent etre confirmes sur la page de documentation
-   du modele avec la cle API de l'organisation. Les endpoints `createTask` /
-   `recordInfo`, l'authentification et les champs `prompt`, `image_urls`,
-   `aspect_ratio`, `output_format` sont conformes a la documentation publique.
-   **Aucun redeploiement n'est necessaire** pour corriger un identifiant :
-   la definition s'edite depuis l'espace d'administration.
+2. **Cle API et quotas** — le catalogue par defaut a ete aligne sur les
+   identifiants et noms de champs reels du fournisseur (voir ci-dessous), mais
+   il n'a pas pu etre execute contre l'API de production depuis cet
+   environnement (docs et API KIE.ai injoignables ; l'integration est validee
+   contre un fournisseur simule reproduisant le contrat). Avant la premiere
+   mise en service, lancer une generation par famille de modeles avec la cle
+   de l'organisation et ajuster si besoin depuis *Administration > Modeles IA*
+   — **aucun redeploiement n'est necessaire**.
+
+### Ecarts corriges lors de l'alignement du catalogue
+
+Ces details ne sont pas devinables et cassent silencieusement une integration ;
+ils sont notes ici pour les prochains ajouts de modeles :
+
+| Point | Realite |
+| --- | --- |
+| Ratio d'image (catalogue market) | champ `image_size`, **pas** `aspect_ratio` |
+| Ratio Seedream | valeurs nommees (`square`, `landscape_16_9`…), pas `16:9` |
+| Resolution Seedream | champ `image_resolution` (`1K`/`2K`/`4K`) |
+| Duree Kling | chaine `"5"` / `"10"` — le fournisseur est strict sur le type |
+| Image unique Kling I2V | champ `image_url` (URL seule), pas `image_urls` |
+| Veo | endpoint dedie, `model` court (`veo3_fast`), images sous `imageUrls` ; ni duree ni mixage audio parametrables |
+| Suno | endpoint dedie, `model` = version du moteur (`V5`), corps a plat |
+| ElevenLabs | champ `voice` (obligatoire), identifiants de voix explicites |

@@ -346,6 +346,7 @@ const modelSchema = z.object({
   kind: z.enum(['image', 'video', 'audio']),
   family: z.string().max(60).optional(),
   providerModel: z.string().min(1).max(120),
+  transport: z.enum(['jobs', 'veo', 'suno']).optional(),
   docsUrl: z.string().max(300).optional(),
   timeoutSeconds: z.number().int().min(30).max(3600).optional(),
   sortOrder: z.number().int().min(0).max(10_000).optional(),

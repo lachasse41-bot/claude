@@ -6,21 +6,23 @@ import { resolveCredentials } from '../../services/apiConfig.js';
 /**
  * Client HTTP KIE.ai.
  * ---------------------------------------------------------------------------
- * Contrat utilise (API "Jobs" unifiee) :
- *   POST {baseUrl}/api/v1/jobs/createTask
- *        body    : { model, input, callBackUrl? }
- *        reponse : { code, msg, data: { taskId } }
- *   GET  {baseUrl}/api/v1/jobs/recordInfo?taskId=...
- *        reponse : { code, msg, data: { taskId, model, state, resultJson,
- *                                       failCode, failMsg, ... } }
- *   Authentification : header `Authorization: Bearer <API_KEY>`
+ * KIE.ai expose plusieurs familles d'endpoints. Le transport declare par le
+ * modele (voir `TRANSPORTS` dans @nova/shared) determine ou envoyer la demande
+ * et comment emballer les parametres :
  *
- * Les etats renvoyes par le provider sont : waiting | queuing | generating |
- * success | fail.
+ *   jobs  POST /api/v1/jobs/createTask   { model, input: {...} }
+ *         GET  /api/v1/jobs/recordInfo?taskId=...
+ *   veo   POST /api/v1/veo/generate      { model, ...params }
+ *         GET  /api/v1/veo/record-info?taskId=...
+ *   suno  POST /api/v1/generate          { model, customMode, ...params }
+ *         GET  /api/v1/generate/record-info?taskId=...
+ *
+ * Authentification : header `Authorization: Bearer <API_KEY>` dans tous les cas.
+ * Etats renvoyes : waiting | queuing | generating | success | fail, ou un
+ * `successFlag` numerique selon l'endpoint — les deux sont normalises.
  */
 
-export const CREATE_TASK_PATH = '/api/v1/jobs/createTask';
-export const RECORD_INFO_PATH = '/api/v1/jobs/recordInfo';
+import { TRANSPORTS, type TransportKey } from '@nova/shared';
 
 export type ProviderState = 'waiting' | 'queuing' | 'generating' | 'success' | 'fail';
 
@@ -146,17 +148,34 @@ function providerMessage(payload: KieEnvelope<unknown>): string | null {
   return raw.slice(0, 300);
 }
 
+/** Construit le corps de la requete selon le style declare par le transport. */
+export function buildRequestBody(
+  transport: TransportKey,
+  model: string,
+  payload: Record<string, unknown>,
+  callbackUrl?: string,
+): Record<string, unknown> {
+  const spec = TRANSPORTS[transport];
+  const body: Record<string, unknown> =
+    spec.payloadStyle === 'input'
+      ? { model, input: payload }
+      : { model, ...spec.constantBody, ...payload };
+  if (callbackUrl) body.callBackUrl = callbackUrl;
+  return body;
+}
+
 export async function createTask(input: {
   organizationId: string;
+  transport: TransportKey;
   model: string;
   payload: Record<string, unknown>;
   callbackUrl?: string;
 }): Promise<CreateTaskResult> {
-  const body: Record<string, unknown> = { model: input.model, input: input.payload };
-  if (input.callbackUrl) body.callBackUrl = input.callbackUrl;
+  const spec = TRANSPORTS[input.transport];
+  const body = buildRequestBody(input.transport, input.model, input.payload, input.callbackUrl);
 
   const res = await request<{ taskId?: string; task_id?: string }>(
-    input.organizationId, 'POST', CREATE_TASK_PATH, body,
+    input.organizationId, 'POST', spec.createPath, body,
   );
   const taskId = res.data?.taskId ?? res.data?.task_id;
   if (!taskId) {
@@ -171,20 +190,33 @@ interface RecordInfoData {
   status?: string;
   successFlag?: number;
   resultJson?: string | Record<string, unknown>;
+  /** Les endpoints dedies imbriquent parfois le resultat sous `response`. */
+  response?: Record<string, unknown>;
   failCode?: string | number;
   failMsg?: string;
+  errorMessage?: string;
   costTime?: number;
 }
 
-export async function getTask(organizationId: string, taskId: string): Promise<TaskRecord> {
-  const res = await request<RecordInfoData>(organizationId, 'GET', RECORD_INFO_PATH, undefined, { taskId });
+export async function getTask(
+  organizationId: string,
+  taskId: string,
+  transport: TransportKey = 'jobs',
+): Promise<TaskRecord> {
+  const res = await request<RecordInfoData>(
+    organizationId, 'GET', TRANSPORTS[transport].statusPath, undefined, { taskId },
+  );
   const data = res.data ?? {};
   return {
     taskId: data.taskId ?? taskId,
     state: normalizeState(data),
-    resultUrls: extractResultUrls(data.resultJson),
+    // Selon l'endpoint le resultat vit sous `resultJson` (chaine JSON) ou sous
+    // `response` (objet). On accepte les deux.
+    resultUrls: extractResultUrls(data.resultJson ?? data.response),
     failCode: data.failCode !== undefined && data.failCode !== null ? String(data.failCode) : null,
-    failMessage: data.failMsg ? String(data.failMsg).slice(0, 500) : null,
+    failMessage: (data.failMsg ?? data.errorMessage)
+      ? String(data.failMsg ?? data.errorMessage).slice(0, 500)
+      : null,
     costTimeMs: typeof data.costTime === 'number' ? data.costTime : null,
     raw: res,
   };
@@ -243,7 +275,7 @@ export async function checkConnectivity(organizationId: string): Promise<{ ok: b
   try {
     // `recordInfo` sur un identifiant inexistant : valide la cle et la
     // joignabilite sans consommer de credits provider.
-    await getTask(organizationId, 'connectivity-check');
+    await getTask(organizationId, 'connectivity-check', 'jobs');
     return { ok: true, message: 'Connexion etablie avec KIE.ai.' };
   } catch (error) {
     if (error instanceof AppError) {

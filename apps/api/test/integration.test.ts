@@ -192,10 +192,10 @@ describe('Generation de contenu', () => {
   test('les parametres sont valides cote serveur', async () => {
     const ratio = await api('POST', '/generations', {
       cookie,
-      body: { modelKey: 'nano-banana', params: { prompt: 'test', aspect_ratio: '42:1' } },
+      body: { modelKey: 'nano-banana', params: { prompt: 'test', image_size: '42:1' } },
     });
     assert.equal(ratio.status, 400);
-    assert.ok(ratio.body.error.fields.aspect_ratio);
+    assert.ok(ratio.body.error.fields.image_size);
 
     const inconnu = await api('POST', '/generations', {
       cookie,
@@ -218,7 +218,7 @@ describe('Generation de contenu', () => {
       cookie,
       body: {
         modelKey: 'nano-banana-edit',
-        params: { prompt: 'Studio lumineux', image_urls: [fileId], aspect_ratio: '16:9' },
+        params: { prompt: 'Studio lumineux', image_urls: [fileId], image_size: '16:9' },
         outputCount: 1,
       },
     });
@@ -249,7 +249,7 @@ describe('Generation de contenu', () => {
     const body = createCall.body as any;
     assert.equal(body.model, 'google/nano-banana-edit');
     assert.equal(body.input.prompt, 'Studio lumineux');
-    assert.equal(body.input.aspect_ratio, '16:9');
+    assert.equal(body.input.image_size, '16:9');
     assert.equal(body.input.image_urls.length, 1);
     assert.match(body.input.image_urls[0], /\/api\/files\/public\/.+signature=/);
     assert.ok(body.callBackUrl.includes('/api/webhooks/kie/'));
@@ -279,7 +279,7 @@ describe('Generation de contenu', () => {
     // simule : on demande plus de sorties que le solde ne le permet.
     const res = await api('POST', '/generations', {
       cookie,
-      body: { modelKey: 'veo3-fast', params: { prompt: 'trop cher' }, outputCount: 4 },
+      body: { modelKey: 'veo-3-fast', params: { prompt: 'trop cher' }, outputCount: 4 },
     });
     assert.equal(res.status, 402, `solde=${balance}`);
     assert.equal(res.body.error.code, 'insufficient_credits');
@@ -589,5 +589,211 @@ describe('Robustesse', () => {
     assert.ok(broken, 'le modele reste liste');
     assert.deepEqual(broken.params, []);
     assert.ok(catalogue.body.models.length > 1, 'les autres modeles restent disponibles');
+  });
+});
+
+describe('Transports provider', () => {
+  let cookie = '';
+
+  before(async () => {
+    cookie = (await api('POST', '/auth/login', {
+      body: { email: 'admin@test.local', password: 'AdminTest123' },
+    })).cookie!;
+  });
+
+  /** Derniere requete de creation envoyee au fournisseur, quel que soit l'endpoint. */
+  function lastCreateCall(path: string) {
+    return mock.requests.filter((r) => r.path === path).at(-1);
+  }
+
+  test("Veo passe par son endpoint dedie avec un corps a plat", async () => {
+    const created = await api('POST', '/generations', {
+      cookie,
+      body: {
+        modelKey: 'veo-3-fast',
+        params: { prompt: 'Un plan large sur une vallee', aspect_ratio: '9:16' },
+      },
+    });
+    assert.equal(created.status, 201);
+    const generation = await waitForState(created.body.generations[0].id, cookie);
+    assert.equal(generation.state, 'completed', generation.errorMessage ?? '');
+
+    const call = lastCreateCall('/api/v1/veo/generate');
+    assert.ok(call, 'la tache doit etre creee sur /api/v1/veo/generate');
+    const body = call!.body as Record<string, unknown>;
+    // Corps a plat : pas d'enveloppe `input`, et le modele est la valeur courte.
+    assert.equal(body.model, 'veo3_fast');
+    assert.equal(body.input, undefined);
+    assert.equal(body.prompt, 'Un plan large sur une vallee');
+    assert.equal(body.aspect_ratio, '9:16');
+    assert.equal(body.enableTranslation, true);
+
+    // Le suivi a bien utilise l'endpoint dedie, pas celui de l'API Jobs.
+    assert.ok(mock.requests.some((r) => r.path === '/api/v1/veo/record-info'));
+  });
+
+  test('Suno passe par son endpoint dedie et son mode simple', async () => {
+    const created = await api('POST', '/generations', {
+      cookie,
+      body: {
+        modelKey: 'suno-music',
+        params: { prompt: 'Ambiance lo-fi douce', instrumental: true, style: 'lo-fi' },
+      },
+    });
+    assert.equal(created.status, 201);
+    const generation = await waitForState(created.body.generations[0].id, cookie);
+    assert.equal(generation.state, 'completed', generation.errorMessage ?? '');
+
+    const call = lastCreateCall('/api/v1/generate');
+    assert.ok(call, 'la tache doit etre creee sur /api/v1/generate');
+    const body = call!.body as Record<string, unknown>;
+    assert.equal(body.model, 'V5');
+    assert.equal(body.customMode, false, 'le mode simple est impose par le transport');
+    assert.equal(body.instrumental, true);
+    assert.equal(body.style, 'lo-fi');
+  });
+
+  test('un modele produisant plusieurs sorties ne cree qu une seule tache', async () => {
+    const before = mock.requests.filter((r) => r.path === '/api/v1/jobs/createTask').length;
+
+    const created = await api('POST', '/generations', {
+      cookie,
+      body: {
+        modelKey: 'seedream-v4',
+        params: { prompt: 'Trois variantes d une affiche', image_resolution: '1K' },
+        outputCount: 3,
+      },
+    });
+    assert.equal(created.status, 201);
+    // Une seule ligne de generation, et non trois.
+    assert.equal(created.body.generations.length, 1);
+
+    const generation = await waitForState(created.body.generations[0].id, cookie);
+    assert.equal(generation.state, 'completed', generation.errorMessage ?? '');
+
+    const after = mock.requests.filter((r) => r.path === '/api/v1/jobs/createTask').length;
+    assert.equal(after - before, 1, 'une seule tache doit etre envoyee au fournisseur');
+
+    const call = lastCreateCall('/api/v1/jobs/createTask');
+    const input = (call!.body as { input: Record<string, unknown> }).input;
+    assert.equal(input.max_images, 3);
+    assert.equal(input.image_size, 'landscape_16_9');
+    assert.equal(input.image_resolution, '1K');
+    // Les trois images arrivent dans la meme generation.
+    assert.equal(generation.assets.filter((a: any) => a.kind === 'output').length, 3);
+    // Le cout couvre bien les trois sorties.
+    assert.equal(generation.creditCost, created.body.creditCost);
+  });
+
+  test("un parametre conditionnel n'est ni exige ni transmis lorsqu'il est masque", async () => {
+    // Aucun modele du catalogue verifie n'utilise `visibleWhen` aujourd'hui ;
+    // la capacite est donc couverte par un modele cree via l'administration,
+    // exactement comme le ferait un administrateur pour un nouveau modele.
+    await api('PUT', '/admin/models/modele-conditionnel', {
+      cookie,
+      body: {
+        name: 'Modele conditionnel',
+        kind: 'image',
+        providerModel: 'fournisseur/conditionnel',
+        outputs: { mode: 'fanout', min: 1, max: 1, default: 1 },
+        credits: { base: 2, perOutput: true },
+        params: [
+          { id: 'prompt', field: 'prompt', label: 'Prompt', group: 'core', type: 'textarea', default: '', maxLength: 500, required: true },
+          { id: 'avance', field: null, label: 'Mode avance', group: 'advanced', type: 'boolean', default: false },
+          {
+            id: 'reglage', field: 'reglage', label: 'Reglage fin', group: 'advanced',
+            type: 'text', default: '', maxLength: 100, required: true,
+            visibleWhen: { paramId: 'avance', equals: [true] },
+          },
+        ],
+      },
+    });
+
+    // Masque : le champ obligatoire n'est pas exige et n'est pas transmis.
+    const masque = await api('POST', '/generations', {
+      cookie,
+      body: { modelKey: 'modele-conditionnel', params: { prompt: 'sans mode avance', avance: false } },
+    });
+    assert.equal(masque.status, 201);
+    await waitForState(masque.body.generations[0].id, cookie);
+    let input = (lastCreateCall('/api/v1/jobs/createTask')!.body as { input: Record<string, unknown> }).input;
+    assert.equal(input.reglage, undefined, 'le parametre masque ne doit pas etre transmis');
+    // `field: null` : parametre purement applicatif, jamais transmis non plus.
+    assert.equal(input.avance, undefined);
+
+    // Visible : le champ redevient obligatoire.
+    const vide = await api('POST', '/generations', {
+      cookie,
+      body: { modelKey: 'modele-conditionnel', params: { prompt: 'avec mode avance', avance: true } },
+    });
+    assert.equal(vide.status, 400);
+    assert.ok(vide.body.error.fields.reglage);
+
+    const rempli = await api('POST', '/generations', {
+      cookie,
+      body: {
+        modelKey: 'modele-conditionnel',
+        params: { prompt: 'avec mode avance', avance: true, reglage: 'valeur' },
+      },
+    });
+    assert.equal(rempli.status, 201);
+    await waitForState(rempli.body.generations[0].id, cookie);
+    input = (lastCreateCall('/api/v1/jobs/createTask')!.body as { input: Record<string, unknown> }).input;
+    assert.equal(input.reglage, 'valeur');
+  });
+
+  test('la resolution influe reellement sur le cout facture', async () => {
+    const base = await api('POST', '/models/seedream-v4/estimate', {
+      cookie,
+      body: { params: { prompt: 'x', image_resolution: '1K' }, outputCount: 1 },
+    });
+    const high = await api('POST', '/models/seedream-v4/estimate', {
+      cookie,
+      body: { params: { prompt: 'x', image_resolution: '4K' }, outputCount: 1 },
+    });
+    assert.equal(base.status, 200);
+    assert.ok(
+      high.body.totalCost > base.body.totalCost,
+      `4K (${high.body.totalCost}) doit couter plus cher que 1K (${base.body.totalCost})`,
+    );
+
+    // Le multiplicateur se cumule avec le nombre de sorties.
+    const batch = await api('POST', '/models/seedream-v4/estimate', {
+      cookie,
+      body: { params: { prompt: 'x', image_resolution: '4K' }, outputCount: 3 },
+    });
+    assert.equal(batch.body.totalCost, high.body.totalCost * 3);
+  });
+
+  test('le ratio est transmis sous le nom de champ attendu par chaque modele', async () => {
+    // Nano Banana attend `image_size`, pas `aspect_ratio`.
+    const created = await api('POST', '/generations', {
+      cookie,
+      body: { modelKey: 'nano-banana', params: { prompt: 'test ratio', image_size: '21:9' } },
+    });
+    assert.equal(created.status, 201);
+    await waitForState(created.body.generations[0].id, cookie);
+
+    const input = (lastCreateCall('/api/v1/jobs/createTask')!.body as { input: Record<string, unknown> }).input;
+    assert.equal(input.image_size, '21:9');
+    assert.equal(input.aspect_ratio, undefined);
+  });
+
+  test('Kling transmet la duree en chaine, comme l exige le fournisseur', async () => {
+    const created = await api('POST', '/generations', {
+      cookie,
+      body: {
+        modelKey: 'kling-t2v',
+        params: { prompt: 'Un plan sequence', duration: '10', cfg_scale: 0.5 },
+      },
+    });
+    assert.equal(created.status, 201);
+    await waitForState(created.body.generations[0].id, cookie);
+
+    const input = (lastCreateCall('/api/v1/jobs/createTask')!.body as { input: Record<string, unknown> }).input;
+    assert.equal(input.duration, '10');
+    assert.equal(typeof input.duration, 'string');
+    // Le cout double avec la duree, conformement au multiplicateur declare.
+    assert.ok(created.body.creditCost >= 50);
   });
 });
