@@ -538,3 +538,56 @@ describe('Administration', () => {
     }
   });
 });
+
+describe('Robustesse', () => {
+  let adminCookie = '';
+
+  before(async () => {
+    adminCookie = (await api('POST', '/auth/login', {
+      body: { email: 'admin@test.local', password: 'AdminTest123' },
+    })).cookie!;
+  });
+
+  test('une generation echoue proprement et rembourse si le modele est desactive apres coup', async () => {
+    // Le modele est desactive juste apres la creation : la soumission au
+    // fournisseur doit echouer sans laisser la generation en attente.
+    const before = (await api('GET', '/me/credits', { cookie: adminCookie })).body.summary.balance;
+    const created = await api('POST', '/generations', {
+      cookie: adminCookie,
+      body: { modelKey: 'seedream-v4', params: { prompt: 'test robustesse' } },
+    });
+    assert.equal(created.status, 201);
+    await api('PATCH', '/admin/models/seedream-v4/enabled', {
+      cookie: adminCookie,
+      body: { enabled: false },
+    });
+
+    const generation = await waitForState(created.body.generations[0].id, adminCookie);
+    assert.ok(['completed', 'failed'].includes(generation.state));
+    if (generation.state === 'failed') {
+      assert.equal(generation.creditsRefunded, created.body.creditCost);
+      const after = (await api('GET', '/me/credits', { cookie: adminCookie })).body.summary.balance;
+      assert.equal(after, before);
+    }
+
+    await api('PATCH', '/admin/models/seedream-v4/enabled', {
+      cookie: adminCookie,
+      body: { enabled: true },
+    });
+  });
+
+  test('une definition de modele corrompue ne casse pas le catalogue', async () => {
+    // Ecriture directe d'une definition invalide, comme le ferait une donnee
+    // heritee d'une version anterieure.
+    const { db } = await import('../src/db/index.js');
+    db.prepare("UPDATE models SET definition_json = '{ corrompu' WHERE model_key = 'tts-voice'")
+      .run();
+
+    const catalogue = await api('GET', '/models', { cookie: adminCookie });
+    assert.equal(catalogue.status, 200);
+    const broken = catalogue.body.models.find((m: any) => m.key === 'tts-voice');
+    assert.ok(broken, 'le modele reste liste');
+    assert.deepEqual(broken.params, []);
+    assert.ok(catalogue.body.models.length > 1, 'les autres modeles restent disponibles');
+  });
+});

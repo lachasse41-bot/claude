@@ -18,10 +18,22 @@ interface ModelRow {
   sort_order: number; created_at: string; updated_at: string;
 }
 
+/** Valeurs de repli : une definition corrompue ne doit pas casser le catalogue. */
+const SAFE_DEFAULTS = {
+  params: [] as ParamSpec[],
+  outputs: { mode: 'fanout', min: 1, max: 1, default: 1 } as ModelDefinition['outputs'],
+  credits: { base: 1, perOutput: true } as ModelDefinition['credits'],
+};
+
 function toSummary(row: ModelRow): ModelSummary {
-  const definition = parseJson<ModelDefinition>(row.definition_json, {} as ModelDefinition);
+  const definition = parseJson<Partial<ModelDefinition>>(row.definition_json, {});
   const merged: ModelDefinition = {
+    ...SAFE_DEFAULTS,
     ...definition,
+    params: Array.isArray(definition.params) ? definition.params : SAFE_DEFAULTS.params,
+    outputs: definition.outputs ?? SAFE_DEFAULTS.outputs,
+    credits: definition.credits ?? SAFE_DEFAULTS.credits,
+    providerModelVerification: definition.providerModelVerification ?? 'unverified',
     key: row.model_key,
     name: row.name,
     description: row.description,

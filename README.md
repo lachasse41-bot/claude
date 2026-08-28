@@ -288,7 +288,7 @@ Les erreurs suivent une enveloppe unique et typee :
 ## Tests
 
 ```bash
-npm test          # 22 tests d'integration (API reelle + fournisseur simule)
+npm test          # 24 tests d'integration (API reelle + fournisseur simule)
 npm run typecheck # verification TypeScript des trois paquets
 ```
 
@@ -298,7 +298,9 @@ rejeu de jeton), la validation des parametres, le cycle complet d'une
 generation reussie, le remboursement en cas d'echec, le blocage sur solde
 insuffisant, l'isolation stricte entre collaborateurs, la galerie, les
 workflows multi-etapes, la desactivation et la suppression de comptes,
-l'ajout d'un modele a chaud et la non-divulgation de la cle API.
+l'ajout d'un modele a chaud, la non-divulgation de la cle API, ainsi que deux
+cas de robustesse : desactivation d'un modele pendant une generation en vol et
+definition de modele corrompue en base.
 
 Le fournisseur est simule par un serveur HTTP local reproduisant le contrat
 KIE.ai (`apps/api/test/mockKie.ts`) : aucun credit reel n'est consomme.

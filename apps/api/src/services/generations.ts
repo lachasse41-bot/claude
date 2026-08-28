@@ -339,10 +339,13 @@ export async function submitToProvider(generationId: string, preloaded?: ModelSu
   if (!row || row.state !== 'queued' || row.external_task_id) return;
   if (!claimForSubmission(generationId)) return;
 
-  const model = preloaded ?? getEnabledModel(row.organization_id, row.model_key);
   const payload = parseJson<Record<string, unknown>>(row.provider_input_json, {});
 
   try {
+    // Resolu ici (et non avant) pour qu'une desactivation du modele entre la
+    // creation et la soumission fasse echouer proprement la generation, avec
+    // remboursement, plutot que de la laisser en attente jusqu'au delai maximum.
+    const model = preloaded ?? getEnabledModel(row.organization_id, row.model_key);
     const task = await kie.createTask({
       organizationId: row.organization_id,
       model: model.providerModel,
