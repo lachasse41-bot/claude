@@ -7,6 +7,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { startMockKie, PNG, type MockKie } from './mockKie.js';
 import { extractLink, startMockSmtp, type MockSmtp } from './mockSmtp.js';
+import { startMockEmailApi, type MockEmailApi } from './mockEmailApi.js';
 
 /* Isolation complete : base et stockage temporaires, provider simule. */
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nova-test-'));
@@ -22,6 +23,7 @@ process.env.POLL_INTERVAL_MS = '1';
 
 let mock: MockKie;
 let smtp: MockSmtp;
+let emailApi: MockEmailApi;
 let server: Server;
 let baseUrl: string;
 let tick: () => Promise<void>;
@@ -59,6 +61,9 @@ before(async () => {
   // Service d'envoi d'e-mails simule, configure par variables d'environnement
   // (le chemin « configuration d'organisation » est teste separement).
   smtp = await startMockSmtp();
+  // Fournisseur d'e-mail par API HTTP simule (mode sans relais SMTP).
+  emailApi = await startMockEmailApi('cle-api-test');
+  process.env.EMAIL_API_ENDPOINT_OVERRIDE = emailApi.url;
   process.env.SMTP_HOST = '127.0.0.1';
   process.env.SMTP_PORT = String(smtp.port);
   process.env.SMTP_SECURE = 'false';
@@ -83,6 +88,7 @@ after(async () => {
   const { resetTransporters } = await import('../src/services/mailer.js');
   resetTransporters();
   await smtp?.close();
+  await emailApi?.close();
   await mock?.close();
   fs.rmSync(tmp, { recursive: true, force: true });
 });
@@ -990,5 +996,186 @@ describe('Envoi des e-mails', () => {
     assert.equal(status.source, 'environment');
 
     await api('PUT', '/admin/email-configuration', { cookie: adminCookie, body: { enabled: true } });
+  });
+});
+
+describe("Fonctionnement sans service d'e-mail", () => {
+  let adminCookie = '';
+
+  before(async () => {
+    adminCookie = (await api('POST', '/auth/login', {
+      body: { email: 'admin@test.local', password: 'AdminTest123' },
+    })).cookie!;
+  });
+
+  test("un administrateur peut emettre un lien de reinitialisation a transmettre", async () => {
+    const users = (await api('GET', '/admin/users?search=lea', { cookie: adminCookie })).body;
+    const lea = users.items[0];
+
+    const issued = await api('POST', `/admin/users/${lea.id}/password-reset`, { cookie: adminCookie });
+    assert.equal(issued.status, 200);
+    assert.match(issued.body.resetUrl, /\/reset-password\?token=/);
+    assert.equal(issued.body.email, lea.email);
+
+    // Le lien fonctionne reellement, meme sans e-mail.
+    const token = new URL(issued.body.resetUrl).searchParams.get('token')!;
+    const reset = await api('POST', '/auth/reset-password', {
+      body: { token, password: 'ResetParAdmin123' },
+    });
+    assert.equal(reset.status, 200);
+
+    const login = await api('POST', '/auth/login', {
+      body: { email: lea.email, password: 'ResetParAdmin123' },
+    });
+    assert.equal(login.status, 200);
+
+    // L'action est tracee comme sensible.
+    const activity = (await api('GET', '/admin/activity?action=admin.password_reset_issued', {
+      cookie: adminCookie,
+    })).body;
+    assert.ok(activity.items.length > 0);
+    assert.equal(activity.items[0].targetName, lea.name);
+  });
+
+  test("le lien de reinitialisation est refuse pour un compte desactive", async () => {
+    const users = (await api('GET', '/admin/users?search=lea', { cookie: adminCookie })).body;
+    const lea = users.items[0];
+    await api('PATCH', `/admin/users/${lea.id}/status`, {
+      cookie: adminCookie, body: { status: 'disabled' },
+    });
+
+    const issued = await api('POST', `/admin/users/${lea.id}/password-reset`, { cookie: adminCookie });
+    assert.equal(issued.status, 409);
+
+    await api('PATCH', `/admin/users/${lea.id}/status`, {
+      cookie: adminCookie, body: { status: 'active' },
+    });
+  });
+
+  test('une invitation peut etre reemise, ce qui invalide le lien precedent', async () => {
+    const created = await api('POST', '/admin/invitations', {
+      cookie: adminCookie,
+      body: { email: 'paul@test.local', role: 'collaborator' },
+    });
+    const ancienToken = created.body.invitation.inviteUrl.split('token=')[1];
+
+    const resent = await api('POST', `/admin/invitations/${created.body.invitation.id}/resend`, {
+      cookie: adminCookie,
+    });
+    assert.equal(resent.status, 201);
+    const nouveauToken = resent.body.invitation.inviteUrl.split('token=')[1];
+    assert.notEqual(nouveauToken, ancienToken);
+
+    // L'ancien lien ne fonctionne plus, le nouveau oui.
+    const ancien = await api('GET', `/auth/invitation?token=${encodeURIComponent(ancienToken)}`);
+    assert.equal(ancien.status, 400);
+    const nouveau = await api('GET', `/auth/invitation?token=${encodeURIComponent(nouveauToken)}`);
+    assert.equal(nouveau.status, 200);
+    assert.equal(nouveau.body.invitation.email, 'paul@test.local');
+  });
+
+});
+
+describe("Envoi par API HTTP (sans relais SMTP)", () => {
+  let adminCookie = '';
+
+  before(async () => {
+    adminCookie = (await api('POST', '/auth/login', {
+      body: { email: 'admin@test.local', password: 'AdminTest123' },
+    })).cookie!;
+    await api('PUT', '/admin/email-configuration', {
+      cookie: adminCookie,
+      body: {
+        enabled: true,
+        provider: 'resend',
+        apiKey: 'cle-api-test',
+        fromName: 'Nova Studio',
+        fromEmail: 'nova@test.local',
+      },
+    });
+  });
+
+  after(async () => {
+    // Retour au mode SMTP pour ne pas perturber d'eventuelles suites suivantes.
+    await api('PUT', '/admin/email-configuration', {
+      cookie: adminCookie,
+      body: { enabled: true, provider: 'smtp' },
+    });
+  });
+
+  test('Resend recoit le corps attendu et la cle en Bearer', async () => {
+    const before = emailApi.calls.length;
+    const created = await api('POST', '/admin/invitations', {
+      cookie: adminCookie,
+      body: { email: 'api-resend@test.local', role: 'collaborator', initialCredits: 50 },
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.delivery.delivered, true);
+
+    const call = emailApi.calls.at(-1)!;
+    assert.ok(emailApi.calls.length > before);
+    assert.equal(call.headers.authorization, 'Bearer cle-api-test');
+    assert.equal((call.body.from as string), 'Nova Studio <nova@test.local>');
+    assert.deepEqual(call.body.to, ['api-resend@test.local']);
+    assert.match(call.body.subject as string, /Rejoignez/);
+    assert.ok((call.body.html as string).includes('/register?token='));
+    assert.ok((call.body.text as string).includes('/register?token='));
+  });
+
+  test('Brevo recoit sa propre forme de corps et son en-tete api-key', async () => {
+    await api('PUT', '/admin/email-configuration', {
+      cookie: adminCookie,
+      body: { provider: 'brevo', apiKey: 'cle-api-test' },
+    });
+
+    const created = await api('POST', '/admin/invitations', {
+      cookie: adminCookie,
+      body: { email: 'api-brevo@test.local', role: 'collaborator' },
+    });
+    assert.equal(created.body.delivery.delivered, true);
+
+    const call = emailApi.calls.at(-1)!;
+    assert.equal(call.headers['api-key'], 'cle-api-test');
+    assert.equal(call.headers.authorization, undefined);
+    assert.deepEqual(call.body.sender, { email: 'nova@test.local', name: 'Nova Studio' });
+    assert.deepEqual(call.body.to, [{ email: 'api-brevo@test.local' }]);
+    assert.ok(call.body.htmlContent);
+    assert.ok(call.body.textContent);
+  });
+
+  test("le refus du fournisseur est remonte a l'administrateur sans bloquer l'invitation", async () => {
+    emailApi.nextStatus = 403;
+    emailApi.nextError = 'The domain is not verified';
+
+    const created = await api('POST', '/admin/invitations', {
+      cookie: adminCookie,
+      body: { email: 'refus@test.local', role: 'collaborator' },
+    });
+    assert.equal(created.status, 201, "l'invitation doit exister malgre le refus");
+    assert.equal(created.body.delivery.delivered, false);
+    assert.match(created.body.delivery.reason, /domain is not verified/);
+    assert.ok(created.body.invitation.inviteUrl);
+  });
+
+  test("la cle API est chiffree et jamais renvoyee", async () => {
+    const settings = await api('GET', '/admin/settings', { cookie: adminCookie });
+    assert.ok(!JSON.stringify(settings.body).includes('cle-api-test'));
+    assert.equal(settings.body.emailConfiguration.hasApiKey, true);
+    assert.equal(settings.body.emailConfiguration.provider, 'brevo');
+
+    const { db } = await import('../src/db/index.js');
+    const stored = db.prepare('SELECT api_key_encrypted FROM email_configurations LIMIT 1')
+      .get() as { api_key_encrypted: string };
+    assert.ok(stored.api_key_encrypted.startsWith('v1.'));
+    assert.ok(!stored.api_key_encrypted.includes('cle-api-test'));
+  });
+
+  test("activer un fournisseur HTTP sans cle est refuse", async () => {
+    const res = await api('PUT', '/admin/email-configuration', {
+      cookie: adminCookie,
+      body: { enabled: true, provider: 'resend', apiKey: null },
+    });
+    assert.equal(res.status, 400);
+    assert.ok(res.body.error.fields.apiKey);
   });
 });

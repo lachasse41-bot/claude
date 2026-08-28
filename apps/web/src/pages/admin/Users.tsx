@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import {
-  CheckCircle2, Coins, Copy, Mail, MoreHorizontal, Search, Trash2, UserPlus, Users,
+  CheckCircle2, Coins, Copy, KeyRound, Mail, MoreHorizontal, Search, Trash2, UserPlus, Users,
 } from 'lucide-react';
 import type { Invitation, Role } from '@nova/shared';
 import { ApiError, api, query } from '../../lib/api';
@@ -37,6 +37,14 @@ export function AdminUsersPage() {
   const [deleteTarget, setDeleteTarget] = useState<AdminUserRow | null>(null);
   const [detail, setDetail] = useState<AdminUserRow | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Lien de reinitialisation emis pour un collaborateur, affiche une seule fois. */
+  const [resetLink, setResetLink] = useState<
+    { user: AdminUserRow; url: string; delivered: boolean } | null
+  >(null);
+  /** Lien d'invitation reemis, affiche une seule fois. */
+  const [inviteLink, setInviteLink] = useState<
+    { email: string; url: string; delivered: boolean } | null
+  >(null);
 
   const users = useQuery({
     queryKey: ['admin-users', search, role, status, sort],
@@ -93,6 +101,27 @@ export function AdminUsersPage() {
       refreshAll();
     } catch (err) {
       toast.error('Action impossible', err instanceof ApiError ? err.message : undefined);
+    }
+  }
+
+  /**
+   * Emet un lien de reinitialisation a transmettre au collaborateur.
+   * Indispensable lorsque l'organisation n'a pas de service d'e-mail.
+   */
+  async function issueResetLink(row: AdminUserRow) {
+    setBusy(true);
+    try {
+      const response = await api.post<{
+        resetUrl: string;
+        delivery: { delivered: boolean };
+      }>(`/admin/users/${row.id}/password-reset`);
+      setResetLink({ user: row, url: response.resetUrl, delivered: response.delivery.delivered });
+      setDetail(null);
+      refreshAll();
+    } catch (err) {
+      toast.error('Emission impossible', err instanceof ApiError ? err.message : undefined);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -256,6 +285,33 @@ export function AdminUsersPage() {
                   >
                     {{ pending: 'En attente', accepted: 'Acceptee', revoked: 'Revoquee', expired: 'Expiree' }[invitation.status]}
                   </Badge>
+                  {invitation.status !== 'accepted' ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={async () => {
+                        try {
+                          const response = await api.post<{
+                            invitation: Invitation;
+                            delivery: { delivered: boolean };
+                          }>(`/admin/invitations/${invitation.id}/resend`);
+                          setInviteLink({
+                            email: response.invitation.email,
+                            url: response.invitation.inviteUrl ?? '',
+                            delivered: response.delivery?.delivered ?? false,
+                          });
+                          refreshAll();
+                        } catch (err) {
+                          toast.error(
+                            'Renvoi impossible',
+                            err instanceof ApiError ? err.message : undefined,
+                          );
+                        }
+                      }}
+                    >
+                      Nouveau lien
+                    </Button>
+                  ) : null}
                   {invitation.status === 'pending' ? (
                     <Button
                       size="sm"
@@ -326,6 +382,22 @@ export function AdminUsersPage() {
             </Field>
             <div className="border-t border-[var(--border-subtle)] pt-4">
               <Button
+                variant="secondary"
+                full
+                icon={<KeyRound className="size-4" />}
+                loading={busy}
+                onClick={() => issueResetLink(detail)}
+              >
+                Emettre un lien de reinitialisation
+              </Button>
+              <p className="mt-2 text-[12px] text-muted-fg">
+                Le collaborateur choisit lui-meme son nouveau mot de passe. Le lien
+                expire dans une heure et ne sert qu'une fois.
+              </p>
+            </div>
+
+            <div className="border-t border-[var(--border-subtle)] pt-4">
+              <Button
                 variant="danger"
                 full
                 icon={<Trash2 className="size-4" />}
@@ -340,6 +412,89 @@ export function AdminUsersPage() {
                 </p>
               ) : null}
             </div>
+          </div>
+        ) : null}
+      </Modal>
+
+      <Modal
+        open={Boolean(inviteLink)}
+        onClose={() => setInviteLink(null)}
+        title="Nouveau lien d'invitation"
+        description={inviteLink?.email}
+        footer={<Button onClick={() => setInviteLink(null)}>Termine</Button>}
+      >
+        {inviteLink ? (
+          <div className="space-y-4">
+            <InlineNotice tone={inviteLink.delivered ? 'success' : 'warning'}
+              title={inviteLink.delivered ? 'Envoye par e-mail' : 'A transmettre vous-meme'}>
+              Le lien precedent ne fonctionne plus. Celui-ci est valable 14 jours et
+              ne sert qu'une fois.
+            </InlineNotice>
+            <div className="flex gap-2">
+              <Input
+                readOnly value={inviteLink.url} className="font-mono text-[12px]"
+                onFocus={(e) => e.target.select()}
+              />
+              <Button
+                variant="secondary"
+                icon={<Copy className="size-4" />}
+                onClick={() => {
+                  void navigator.clipboard.writeText(inviteLink.url);
+                  toast.success('Lien copie');
+                }}
+              >
+                Copier
+              </Button>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
+
+      <Modal
+        open={Boolean(resetLink)}
+        onClose={() => setResetLink(null)}
+        title="Lien de reinitialisation"
+        description={resetLink ? `${resetLink.user.name} — ${resetLink.user.email}` : undefined}
+        footer={<Button onClick={() => setResetLink(null)}>Termine</Button>}
+      >
+        {resetLink ? (
+          <div className="space-y-4">
+            {resetLink.delivered ? (
+              <InlineNotice
+                tone="success"
+                title="Envoye par e-mail"
+                icon={<CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--success)]" />}
+              >
+                Le collaborateur a recu le lien. Celui-ci reste affiche ci-dessous en secours.
+              </InlineNotice>
+            ) : (
+              <InlineNotice tone="warning" title="A transmettre vous-meme">
+                Aucun envoi automatique n'est configure : transmettez ce lien au
+                collaborateur par le canal de votre choix.
+              </InlineNotice>
+            )}
+            <div className="flex gap-2">
+              <Input
+                readOnly
+                value={resetLink.url}
+                className="font-mono text-[12px]"
+                onFocus={(e) => e.target.select()}
+              />
+              <Button
+                variant="secondary"
+                icon={<Copy className="size-4" />}
+                onClick={() => {
+                  void navigator.clipboard.writeText(resetLink.url);
+                  toast.success('Lien copie');
+                }}
+              >
+                Copier
+              </Button>
+            </div>
+            <p className="text-[12px] text-muted-fg">
+              Valable une heure, utilisable une seule fois. Les sessions ouvertes du
+              collaborateur seront fermees des qu'il aura change son mot de passe.
+            </p>
           </div>
         ) : null}
       </Modal>

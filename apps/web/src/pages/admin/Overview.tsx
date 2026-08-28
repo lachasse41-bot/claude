@@ -17,6 +17,7 @@ const ACTION_LABELS: Record<string, string> = {
   'auth.password_changed': 'Mot de passe modifie',
   'auth.password_reset': 'Mot de passe reinitialise',
   'auth.password_reset_requested': 'Reinitialisation demandee',
+  'user.profile_updated': 'Profil modifie',
   'generation.created': 'Generation lancee',
   'generation.cancelled': 'Generation annulee',
   'generation.deleted': 'Generation supprimee',
@@ -33,7 +34,9 @@ const ACTION_LABELS: Record<string, string> = {
   'admin.credits_granted': 'Credits attribues',
   'admin.overdraft_changed': 'Decouvert modifie',
   'admin.invitation_created': 'Invitation envoyee',
+  'admin.invitation_resent': 'Nouveau lien d invitation',
   'admin.invitation_revoked': 'Invitation revoquee',
+  'admin.password_reset_issued': 'Lien de reinitialisation emis',
   'admin.model_saved': 'Modele enregistre',
   'admin.model_enabled': 'Modele active',
   'admin.model_disabled': 'Modele desactive',
@@ -41,6 +44,8 @@ const ACTION_LABELS: Record<string, string> = {
   'admin.catalog_restored': 'Catalogue restaure',
   'admin.settings_updated': 'Parametres modifies',
   'admin.api_configuration_updated': 'Configuration API modifiee',
+  'admin.email_configuration_updated': 'Configuration e-mail modifiee',
+  'admin.email_configuration_tested': 'Configuration e-mail testee',
 };
 
 export function actionLabel(action: string): string {

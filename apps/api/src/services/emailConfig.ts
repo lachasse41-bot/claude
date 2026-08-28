@@ -1,4 +1,4 @@
-import type { EmailConfigurationStatus } from '@nova/shared';
+import type { EmailConfigurationStatus, EmailProvider } from '@nova/shared';
 import { db, nowIso } from '../db/index.js';
 import { env } from '../env.js';
 import { decryptSecret, encryptSecret } from '../lib/crypto.js';
@@ -6,7 +6,8 @@ import { id } from '../lib/ids.js';
 import { logger } from '../lib/logger.js';
 
 interface EmailConfigRow {
-  id: string; organization_id: string; enabled: number; host: string; port: number;
+  id: string; organization_id: string; enabled: number; provider: string;
+  api_key_encrypted: string | null; host: string; port: number;
   secure: number; username: string; password_encrypted: string | null;
   from_name: string; from_email: string; reply_to: string;
   last_check_at: string | null; last_check_status: string | null; last_check_message: string | null;
@@ -29,13 +30,17 @@ export function ensureEmailConfiguration(organizationId: string): void {
   `).run(id('mcf'), organizationId, env.smtpPort, env.mailFromName, nowIso());
 }
 
-/** Parametres reellement utilisables pour se connecter au serveur SMTP. */
-export interface ResolvedSmtp {
+/** Parametres reellement utilisables pour envoyer un message. */
+export interface ResolvedMailer {
+  provider: EmailProvider;
+  /** Renseigne pour le mode SMTP. */
   host: string;
   port: number;
   secure: boolean;
   username: string;
   password: string;
+  /** Renseigne pour les fournisseurs HTTP. */
+  apiKey: string;
   fromName: string;
   fromEmail: string;
   replyTo: string;
@@ -49,28 +54,48 @@ export interface ResolvedSmtp {
  * Retourne `null` si aucune configuration exploitable n'existe : l'application
  * bascule alors en mode « lien a transmettre manuellement ».
  */
-export function resolveSmtp(organizationId: string): ResolvedSmtp | null {
+export function resolveMailer(organizationId: string): ResolvedMailer | null {
   const config = row(organizationId);
 
-  if (config?.enabled === 1 && config.host && config.from_email) {
-    let password = '';
-    if (config.password_encrypted) {
+  if (config?.enabled === 1 && config.from_email) {
+    const provider = (config.provider as EmailProvider) ?? 'smtp';
+    const decrypt = (value: string | null, label: string): string | null => {
+      if (!value) return '';
       try {
-        password = decryptSecret(config.password_encrypted);
+        return decryptSecret(value);
       } catch (error) {
-        logger.error("Dechiffrement du mot de passe SMTP impossible", {
-          organizationId,
-          error: String(error),
-        });
+        logger.error(`Dechiffrement ${label} impossible`, { organizationId, error: String(error) });
         return null;
       }
+    };
+
+    if (provider === 'smtp') {
+      if (!config.host) return envFallback();
+      const password = decrypt(config.password_encrypted, 'du mot de passe SMTP');
+      if (password === null) return null;
+      return {
+        provider: 'smtp',
+        host: config.host,
+        port: config.port,
+        secure: config.secure === 1,
+        username: config.username,
+        password,
+        apiKey: '',
+        fromName: config.from_name || env.mailFromName,
+        fromEmail: config.from_email,
+        replyTo: config.reply_to,
+        source: 'organization',
+      };
     }
+
+    // Fournisseur HTTP : seule la cle API compte.
+    const apiKey = decrypt(config.api_key_encrypted, 'de la cle API e-mail');
+    if (apiKey === null) return null;
+    if (!apiKey) return envFallback();
     return {
-      host: config.host,
-      port: config.port,
-      secure: config.secure === 1,
-      username: config.username,
-      password,
+      provider,
+      host: '', port: 0, secure: false, username: '', password: '',
+      apiKey,
       fromName: config.from_name || env.mailFromName,
       fromEmail: config.from_email,
       replyTo: config.reply_to,
@@ -78,31 +103,37 @@ export function resolveSmtp(organizationId: string): ResolvedSmtp | null {
     };
   }
 
-  if (env.smtpHost && env.mailFromEmail) {
-    return {
-      host: env.smtpHost,
-      port: env.smtpPort,
-      secure: env.smtpSecure,
-      username: env.smtpUser,
-      password: env.smtpPassword,
-      fromName: env.mailFromName,
-      fromEmail: env.mailFromEmail,
-      replyTo: env.mailReplyTo,
-      source: 'environment',
-    };
-  }
+  return envFallback();
+}
 
-  return null;
+/** Repli sur les variables d'environnement (mode SMTP uniquement). */
+function envFallback(): ResolvedMailer | null {
+  if (!env.smtpHost || !env.mailFromEmail) return null;
+  return {
+    provider: 'smtp',
+    host: env.smtpHost,
+    port: env.smtpPort,
+    secure: env.smtpSecure,
+    username: env.smtpUser,
+    password: env.smtpPassword,
+    apiKey: '',
+    fromName: env.mailFromName,
+    fromEmail: env.mailFromEmail,
+    replyTo: env.mailReplyTo,
+    source: 'environment',
+  };
 }
 
 export function getEmailConfigurationStatus(organizationId: string): EmailConfigurationStatus {
   ensureEmailConfiguration(organizationId);
   const config = row(organizationId)!;
-  const resolved = resolveSmtp(organizationId);
+  const resolved = resolveMailer(organizationId);
 
   return {
     enabled: config.enabled === 1,
     configured: Boolean(resolved),
+    provider: (config.provider as EmailProvider) ?? 'smtp',
+    hasApiKey: Boolean(config.api_key_encrypted),
     host: config.host || (resolved?.source === 'environment' ? resolved.host : ''),
     port: config.port,
     secure: config.secure === 1,
@@ -123,6 +154,9 @@ export function getEmailConfigurationStatus(organizationId: string): EmailConfig
 
 export interface EmailConfigPatch {
   enabled?: boolean;
+  provider?: EmailProvider;
+  /** `null` efface la cle API ; `undefined` la conserve. */
+  apiKey?: string | null;
   host?: string;
   port?: number;
   secure?: boolean;
@@ -148,13 +182,22 @@ export function updateEmailConfiguration(
     encrypted = encryptSecret(patch.password);
   }
 
+  let apiKeyEncrypted = current.api_key_encrypted;
+  if (patch.apiKey === null) apiKeyEncrypted = null;
+  else if (typeof patch.apiKey === 'string' && patch.apiKey.trim().length > 0) {
+    apiKeyEncrypted = encryptSecret(patch.apiKey.trim());
+  }
+
   db.prepare(`
     UPDATE email_configurations
-    SET enabled = ?, host = ?, port = ?, secure = ?, username = ?, password_encrypted = ?,
+    SET enabled = ?, provider = ?, api_key_encrypted = ?,
+        host = ?, port = ?, secure = ?, username = ?, password_encrypted = ?,
         from_name = ?, from_email = ?, reply_to = ?, updated_by = ?, updated_at = ?
     WHERE organization_id = ?
   `).run(
     (patch.enabled ?? current.enabled === 1) ? 1 : 0,
+    patch.provider ?? current.provider ?? 'smtp',
+    apiKeyEncrypted,
     (patch.host ?? current.host).trim(),
     patch.port ?? current.port,
     (patch.secure ?? current.secure === 1) ? 1 : 0,

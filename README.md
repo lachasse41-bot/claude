@@ -53,7 +53,7 @@ npm run seed
 | `PUBLIC_BASE_URL` | URL publique de l'API. **Doit etre joignable depuis Internet** : KIE.ai telecharge les images de reference via des URL signees et appelle le webhook de callback. En local, utiliser un tunnel. |
 | `WEB_ORIGIN` | Origine(s) autorisee(s) du frontend (protection CSRF + CORS). |
 | `KIE_API_KEY` | Cle API par defaut. Elle peut aussi etre saisie depuis *Administration > Parametres*, auquel cas elle est chiffree en base et prioritaire. |
-| `SMTP_HOST`, `MAIL_FROM_EMAIL` | Envoi des e-mails. Optionnel : sans configuration, les liens d'invitation et de reinitialisation restent valides mais se transmettent a la main. Configurable aussi depuis l'espace Administrateur. |
+| `SMTP_HOST`, `MAIL_FROM_EMAIL` | Envoi des e-mails par relais SMTP. **Entierement optionnel** : sans configuration, les liens d'invitation et de reinitialisation s'obtiennent depuis l'espace Administrateur. Un envoi par API (Resend, Brevo) se configure directement dans l'interface, sans relais. |
 | `COOKIE_SECURE` | `true` obligatoire derriere HTTPS. |
 
 La liste complete est documentee dans [`.env.example`](.env.example).
@@ -73,9 +73,10 @@ Le decoupage du serveur suit les domaines metier :
 ```
 apps/api/src/
 ├── providers/kie/     Client HTTP KIE.ai (seul endroit qui parle au fournisseur)
+├── providers/email/   Fournisseurs d'e-mail par API HTTP (Resend, Brevo)
 ├── services/
 │   ├── auth            sessions, invitations, reinitialisation de mot de passe
-│   ├── mailer          envoi SMTP + modeles de messages transactionnels
+│   ├── mailer          envoi SMTP ou API + modeles de messages transactionnels
 │   ├── users           comptes, roles, statuts, suppression
 │   ├── credits         grand livre (reservation, debit, remboursement)
 │   ├── models          catalogue, validation des definitions
@@ -207,22 +208,47 @@ complet reste dans le journal serveur et dans `generations.error_detail_json`.
 
 ## Envoi des e-mails
 
-Deux messages transactionnels sont envoyes : l'**invitation** d'un
-collaborateur et la **reinitialisation de mot de passe** (plus un message
-d'ouverture de compte lors d'une creation directe, et un e-mail de test).
+**L'envoi d'e-mails est facultatif.** La plateforme est concue pour fonctionner
+entierement sans, ce qui est le cas courant pour un outil interne.
 
-La configuration SMTP se fait par variables d'environnement ou depuis
-*Administration > Parametres* (le mot de passe est chiffre AES-256-GCM et
-n'est jamais renvoye au client). Un bouton verifie la connexion et envoie un
-message de test.
+### Sans aucun service d'e-mail
+
+Tout reste faisable depuis l'espace Administrateur, en transmettant un lien
+par le canal de l'equipe (messagerie interne, oral, ticket) :
+
+| Besoin | Ou |
+| --- | --- |
+| Inviter un collaborateur | Le lien s'affiche a la creation de l'invitation |
+| Renvoyer une invitation perdue | *Collaborateurs > Invitations > Nouveau lien* (l'ancien devient invalide) |
+| Un collaborateur a oublie son mot de passe | Sa fiche > *Emettre un lien de reinitialisation* |
+
+L'administrateur n'apprend jamais le mot de passe : le collaborateur le
+choisit lui-meme via le lien, valable une heure et utilisable une seule fois.
+Chaque emission est journalisee comme action sensible.
+
+### Avec un service d'e-mail
+
+Trois modes, au choix dans *Administration > Parametres* :
+
+| Mode | Ce qu'il faut |
+| --- | --- |
+| **Relais SMTP** | Hote, port, identifiants |
+| **Resend** (API) | Une cle API — aucun relais a heberger |
+| **Brevo** (API) | Une cle API — aucun relais a heberger |
+
+Les modes par API n'exigent ni serveur de messagerie ni port ouvert : ils
+conviennent lorsqu'on ne dispose pas d'infrastructure de messagerie. Secrets
+(mot de passe SMTP ou cle API) chiffres AES-256-GCM, jamais renvoyes au client.
+Un bouton verifie la configuration et envoie un message de test.
+
+Messages envoyes : invitation, reinitialisation de mot de passe, ouverture de
+compte, et message de test.
 
 Regles appliquees :
 
 - **L'envoi n'est jamais bloquant.** Une invitation reste creee et valide meme
-  si l'e-mail echoue ; l'interface affiche alors le lien a transmettre.
-- **Sans service configure**, la plateforme reste pleinement utilisable : le
-  lien d'invitation s'affiche a la creation, celui de reinitialisation est
-  ecrit dans le journal serveur.
+  si l'e-mail echoue ; l'interface affiche alors le lien a transmettre, avec la
+  raison exacte du refus renvoyee par le fournisseur.
 - **Aucun mot de passe n'est jamais envoye par e-mail**, y compris lors d'une
   creation de compte par un administrateur.
 - La reponse a « mot de passe oublie » est **identique dans tous les cas** :
@@ -319,7 +345,8 @@ Toutes les routes sont prefixees par `/api`.
 | Generations | `POST /generations`, `GET /generations`, `GET /generations/:id`, `POST /generations/:id/cancel`, `DELETE /generations/:id` |
 | Galerie | `GET /gallery`, `POST /gallery`, `PATCH /gallery/:id`, `DELETE /gallery/:id` |
 | Workflows | `GET|POST /workflows`, `PUT|DELETE /workflows/:id`, `POST /workflows/:id/run`, `/duplicate`, `GET /workflows/runs` |
-| Administration | `/admin/overview`, `/admin/users`, `/admin/credits`, `/admin/activity`, `/admin/invitations`, `/admin/models`, `/admin/settings`, `/admin/api-configuration` |
+| Administration | `/admin/overview`, `/admin/users`, `/admin/credits`, `/admin/activity`, `/admin/invitations`, `/admin/models`, `/admin/settings`, `/admin/api-configuration`, `/admin/email-configuration` |
+| Liens hors e-mail | `POST /admin/users/:id/password-reset`, `POST /admin/invitations/:id/resend` |
 | Webhook | `POST /webhooks/kie/:generationId` (signee) |
 
 Les erreurs suivent une enveloppe unique et typee :
@@ -333,7 +360,7 @@ Les erreurs suivent une enveloppe unique et typee :
 ## Tests
 
 ```bash
-npm test          # 39 tests d'integration (API, fournisseur et SMTP simules)
+npm test          # 52 tests d'integration (API, fournisseur IA, SMTP et API e-mail simules)
 npm run typecheck # verification TypeScript des trois paquets
 ```
 
@@ -347,9 +374,11 @@ l'ajout d'un modele a chaud, la non-divulgation de la cle API, les trois
 transports provider, les sorties multiples en une seule tache, les parametres
 conditionnels, l'envoi reel des e-mails (invitation et reinitialisation
 jusqu'a la connexion effective, absence de mot de passe dans les messages,
-chiffrement du mot de passe SMTP, echec d'envoi non bloquant), ainsi que deux
-cas de robustesse : desactivation d'un modele pendant une generation en vol et
-definition de modele corrompue en base.
+chiffrement des secrets, echec d'envoi non bloquant, formes de corps propres a
+Resend et Brevo), le fonctionnement complet **sans aucun service d'e-mail**
+(fichier dedie, processus isole), ainsi que deux cas de robustesse :
+desactivation d'un modele pendant une generation en vol et definition de modele
+corrompue en base.
 
 Le fournisseur de modeles est simule par un serveur HTTP local reproduisant le
 contrat KIE.ai (`apps/api/test/mockKie.ts`) et la messagerie par un vrai
@@ -390,10 +419,12 @@ lancer une generation par famille de modeles avec la cle de l'organisation et
 ajuster si besoin depuis *Administration > Modeles IA* — **aucun redeploiement
 n'est necessaire**.
 
-L'envoi d'e-mails, lui, est fonctionnel : il est valide de bout en bout contre
-un serveur SMTP reel (invitation recue, compte cree depuis le lien ; lien de
-reinitialisation recu, mot de passe change, reconnexion effective). Il reste a
-renseigner les identifiants de votre relais SMTP.
+L'envoi d'e-mails est fonctionnel et valide de bout en bout contre un serveur
+SMTP reel. Les deux fournisseurs par API (Resend, Brevo) sont implementes
+d'apres leurs API publiques et verifies contre un service simule reproduisant
+leur contrat ; le bouton de test permet de les valider avec votre cle, sans
+risque. Et si vous ne configurez rien, la plateforme reste complete : voir
+[Envoi des e-mails](#envoi-des-e-mails).
 
 ### Ecarts corriges lors de l'alignement du catalogue
 

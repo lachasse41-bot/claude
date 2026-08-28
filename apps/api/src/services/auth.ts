@@ -282,6 +282,58 @@ export function createPasswordReset(email: string): ResetTicket | null {
   return { token, expiresAt, email: user.email, name: user.name };
 }
 
+/**
+ * Cree un ticket de reinitialisation pour un compte designe par un
+ * administrateur. Utile lorsque l'organisation n'a pas de service d'e-mail :
+ * le lien est alors remis de la main a la main.
+ * Contrairement a `createPasswordReset`, l'appelant connait deja le compte :
+ * il n'y a rien a dissimuler, l'absence de compte est une vraie erreur.
+ */
+export function createPasswordResetForUser(
+  organizationId: string,
+  userId: string,
+): ResetTicket & { userId: string } {
+  const user = db.prepare('SELECT * FROM users WHERE id = ? AND organization_id = ?')
+    .get(userId, organizationId) as UserRow | undefined;
+  if (!user) throw notFound('Utilisateur introuvable.');
+  if (user.status !== 'active') {
+    throw new AppError('conflict', "Ce compte est desactive : reactivez-le avant de reinitialiser son mot de passe.");
+  }
+
+  const token = randomToken(24);
+  const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+  db.prepare(`
+    INSERT INTO password_resets (id, user_id, token_hash, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id('pwr'), user.id, sha256(token), expiresAt, nowIso());
+
+  return { token, expiresAt, email: user.email, name: user.name, userId: user.id };
+}
+
+/**
+ * Recree une invitation pour la meme adresse.
+ * Le jeton n'etant stocke que sous forme de hash, un lien perdu ne peut pas
+ * etre relu : on en emet un nouveau, ce qui invalide le precedent.
+ */
+export function resendInvitation(
+  organizationId: string,
+  invitationId: string,
+  createdBy: string,
+): Invitation {
+  const row = db.prepare('SELECT * FROM invitations WHERE id = ? AND organization_id = ?')
+    .get(invitationId, organizationId) as InvitationRow | undefined;
+  if (!row) throw notFound('Invitation introuvable.');
+  if (row.status === 'accepted') throw conflict('Cette invitation a deja ete acceptee.');
+
+  return createInvitation({
+    organizationId,
+    email: row.email,
+    role: row.role,
+    initialCredits: row.initial_credits,
+    createdBy,
+  });
+}
+
 export function consumePasswordReset(token: string, newPassword: string): UserRow {
   const row = db.prepare('SELECT * FROM password_resets WHERE token_hash = ? AND used_at IS NULL')
     .get(sha256(token)) as

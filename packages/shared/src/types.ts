@@ -323,10 +323,21 @@ export interface ApiConfigurationStatus {
   lastCheckMessage: string | null;
 }
 
+/**
+ * Mode d'envoi.
+ *  - 'smtp'  : relais classique (hote, port, identifiants)
+ *  - 'resend' / 'brevo' : API HTTP, une cle suffit — aucun relais requis
+ */
+export const EMAIL_PROVIDERS = ['smtp', 'resend', 'brevo'] as const;
+export type EmailProvider = (typeof EMAIL_PROVIDERS)[number];
+
 export interface EmailConfigurationStatus {
   /** true => les e-mails sont reellement envoyes. */
   enabled: boolean;
   configured: boolean;
+  provider: EmailProvider;
+  /** true lorsqu'une cle API est enregistree (fournisseurs HTTP). */
+  hasApiKey: boolean;
   host: string;
   port: number;
   secure: boolean;

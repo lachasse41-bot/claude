@@ -305,6 +305,9 @@ CREATE TABLE IF NOT EXISTS email_configurations (
   id                  TEXT PRIMARY KEY,
   organization_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   enabled             INTEGER NOT NULL DEFAULT 0,
+  -- smtp : relais classique ; resend / brevo : API HTTP (aucun relais requis).
+  provider            TEXT NOT NULL DEFAULT 'smtp',
+  api_key_encrypted   TEXT,
   host                TEXT NOT NULL DEFAULT '',
   port                INTEGER NOT NULL DEFAULT 587,
   secure              INTEGER NOT NULL DEFAULT 0,   -- TLS implicite (port 465)

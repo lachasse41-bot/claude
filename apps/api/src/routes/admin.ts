@@ -5,7 +5,9 @@ import { clientIp, currentUser, requireAuth, requireRole } from '../middleware/c
 import { badRequest, conflict } from '../lib/errors.js';
 import { listActivity, logActivity } from '../services/activity.js';
 import { adminOverview } from '../services/analytics.js';
-import { createInvitation, listInvitations, revokeInvitation } from '../services/auth.js';
+import {
+  createInvitation, createPasswordResetForUser, listInvitations, resendInvitation, revokeInvitation,
+} from '../services/auth.js';
 import {
   applyLedgerEntry, getBalance, listTransactions, setOverdraft,
 } from '../services/credits.js';
@@ -14,9 +16,9 @@ import {
   deleteModel, listModels, restoreCatalog, setModelEnabled, upsertModel,
 } from '../services/models.js';
 import { getOrganization, getSettings, renameOrganization, updateSettings } from '../services/organizations.js';
-import { sendEmail, verifySmtp, resetTransporters } from '../services/mailer.js';
+import { sendEmail, verifyMailer, resetTransporters } from '../services/mailer.js';
 import {
-  accountCreatedEmail, invitationEmail, testEmail,
+  accountCreatedEmail, invitationEmail, passwordResetEmail, testEmail,
 } from '../services/emailTemplates.js';
 import {
   getEmailConfigurationStatus, recordEmailCheck, updateEmailConfiguration,
@@ -242,6 +244,41 @@ adminRouter.delete('/users/:userId', asyncRoute(async (req, res) => {
   res.json({ ok: true, deleted: result.summary });
 }));
 
+/**
+ * Emet un lien de reinitialisation pour un collaborateur.
+ * ---------------------------------------------------------------------------
+ * Voie de secours lorsqu'aucun service d'e-mail n'est disponible : le lien est
+ * renvoye une seule fois a l'administrateur, qui le transmet par le canal de
+ * son choix. L'administrateur n'apprend jamais le mot de passe : c'est le
+ * collaborateur qui le choisit. L'action est journalisee comme sensible.
+ */
+adminRouter.post('/users/:userId/password-reset', asyncRoute(async (req, res) => {
+  const context = actor(req);
+  const ticket = createPasswordResetForUser(context.organizationId, req.params.userId);
+  const resetUrl = `${env.webOrigins[0] ?? env.publicBaseUrl}/reset-password?token=${ticket.token}`;
+
+  // Si un service d'e-mail est disponible, le collaborateur le recoit aussi.
+  const delivery = await sendEmail({
+    organizationId: context.organizationId,
+    to: ticket.email,
+    kind: 'password_reset_admin',
+    message: passwordResetEmail({ name: ticket.name, resetUrl, expiresAt: ticket.expiresAt }),
+  });
+
+  logActivity({
+    ...context,
+    targetUserId: ticket.userId,
+    targetName: ticket.name,
+    action: 'admin.password_reset_issued',
+    entityType: 'user',
+    entityId: ticket.userId,
+    metadata: { email: ticket.email, emailDelivered: delivery.delivered },
+    ip: clientIp(req),
+  });
+
+  res.json({ resetUrl, expiresAt: ticket.expiresAt, email: ticket.email, delivery });
+}));
+
 /* ------------------------------ Credits ---------------------------- */
 
 const creditSchema = z.object({
@@ -342,6 +379,40 @@ adminRouter.post('/invitations', asyncRoute(async (req, res) => {
     entityType: 'invitation',
     entityId: invitation.id,
     metadata: { email: invitation.email, role: invitation.role, emailDelivered: delivery.delivered },
+    ip: clientIp(req),
+  });
+  res.status(201).json({ invitation, delivery });
+}));
+
+/** Reemet une invitation : le lien precedent devient inutilisable. */
+adminRouter.post('/invitations/:invitationId/resend', asyncRoute(async (req, res) => {
+  const context = actor(req);
+  const invitation = resendInvitation(
+    context.organizationId,
+    req.params.invitationId,
+    context.actorUserId,
+  );
+
+  const delivery = await sendEmail({
+    organizationId: context.organizationId,
+    to: invitation.email,
+    kind: 'invitation',
+    message: invitationEmail({
+      organizationName: getOrganization(context.organizationId).name,
+      inviterName: context.actorName,
+      inviteUrl: invitation.inviteUrl!,
+      role: invitation.role,
+      expiresAt: invitation.expiresAt,
+      credits: invitation.initialCredits,
+    }),
+  });
+
+  logActivity({
+    ...context,
+    action: 'admin.invitation_resent',
+    entityType: 'invitation',
+    entityId: invitation.id,
+    metadata: { email: invitation.email, emailDelivered: delivery.delivered },
     ip: clientIp(req),
   });
   res.status(201).json({ invitation, delivery });
@@ -533,6 +604,8 @@ adminRouter.put('/api-configuration', asyncRoute(async (req, res) => {
 
 const emailConfigSchema = z.object({
   enabled: z.boolean().optional(),
+  provider: z.enum(['smtp', 'resend', 'brevo']).optional(),
+  apiKey: z.string().max(300).nullable().optional(),
   host: z.string().max(200).optional(),
   port: z.number().int().min(1).max(65535).optional(),
   secure: z.boolean().optional(),
@@ -556,10 +629,28 @@ adminRouter.put('/email-configuration', asyncRoute(async (req, res) => {
       throw badRequest('Adresse e-mail invalide.', { [field]: 'Adresse e-mail invalide.' });
     }
   }
-  if (input.enabled && !(input.host ?? '').trim() && !getEmailConfigurationStatus(context.organizationId).host) {
-    throw badRequest("Renseignez le serveur SMTP avant d'activer l'envoi.", {
-      host: 'Serveur SMTP obligatoire.',
-    });
+  // Chaque mode a ses prerequis : hote pour SMTP, cle pour une API HTTP.
+  const before = getEmailConfigurationStatus(context.organizationId);
+  const provider = input.provider ?? before.provider;
+  if (input.enabled) {
+    if (provider === 'smtp' && !(input.host ?? before.host).trim()) {
+      throw badRequest("Renseignez le serveur SMTP avant d'activer l'envoi.", {
+        host: 'Serveur SMTP obligatoire.',
+      });
+    }
+    // `apiKey: null` efface la cle : l'envoi ne peut pas rester actif sans elle.
+    const willHaveApiKey =
+      input.apiKey === null ? false : Boolean(input.apiKey?.trim()) || before.hasApiKey;
+    if (provider !== 'smtp' && !willHaveApiKey) {
+      throw badRequest("Renseignez la cle API avant d'activer l'envoi.", {
+        apiKey: 'Cle API obligatoire.',
+      });
+    }
+    if (!(input.fromEmail ?? before.fromEmail).trim()) {
+      throw badRequest("Renseignez l'adresse d'expedition avant d'activer l'envoi.", {
+        fromEmail: "Adresse d'expedition obligatoire.",
+      });
+    }
   }
 
   const status = updateEmailConfiguration(context.organizationId, input, context.actorUserId);
@@ -582,7 +673,7 @@ adminRouter.post('/email-configuration/test', asyncRoute(async (req, res) => {
   const { sendTo } = z.object({ sendTo: z.string().max(200).optional() }).parse(req.body ?? {});
   const context = actor(req);
 
-  const check = await verifySmtp(context.organizationId);
+  const check = await verifyMailer(context.organizationId);
   recordEmailCheck(context.organizationId, check.ok ? 'ok' : 'error', check.message);
 
   let delivery = null;

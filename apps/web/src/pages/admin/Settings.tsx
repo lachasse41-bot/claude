@@ -3,13 +3,14 @@ import {
   Building2, CheckCircle2, KeyRound, Mail, Plug, Send, ShieldAlert, XCircle,
 } from 'lucide-react';
 import type {
-  ApiConfigurationStatus, EmailConfigurationStatus, OrganizationSettings,
+  ApiConfigurationStatus, EmailConfigurationStatus, EmailProvider, OrganizationSettings,
 } from '@nova/shared';
 import { ApiError, api } from '../../lib/api';
 import { useQuery } from '../../lib/queries';
 import { useAuth } from '../../context/AuthContext';
 import {
-  Badge, Button, Card, CardHeader, Field, InlineNotice, Input, PageHeader, Skeleton, Switch, useToast,
+  Badge, Button, Card, CardHeader, Field, InlineNotice, Input, PageHeader,
+  SegmentedControl, Skeleton, Switch, useToast,
 } from '../../components/ui';
 import { formatDateTime } from '../../lib/format';
 
@@ -252,6 +253,7 @@ function EmailCard({
   const toast = useToast();
   const [form, setForm] = useState({
     enabled: status.enabled,
+    provider: status.provider,
     host: status.host,
     port: status.port,
     secure: status.secure,
@@ -261,6 +263,7 @@ function EmailCard({
     replyTo: status.replyTo,
   });
   const [password, setPassword] = useState('');
+  const [apiKey, setApiKey] = useState('');
   const [testTo, setTestTo] = useState('');
   const [fields, setFields] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
@@ -269,6 +272,7 @@ function EmailCard({
   useEffect(() => {
     setForm({
       enabled: status.enabled,
+      provider: status.provider,
       host: status.host,
       port: status.port,
       secure: status.secure,
@@ -286,8 +290,10 @@ function EmailCard({
       await api.put('/admin/email-configuration', {
         ...form,
         password: password.trim() ? password : undefined,
+        apiKey: apiKey.trim() ? apiKey : undefined,
       });
       setPassword('');
+      setApiKey('');
       toast.success('Configuration enregistree');
       onSaved();
     } catch (err) {
@@ -338,10 +344,11 @@ function EmailCard({
       />
       <div className="space-y-4 p-5">
         {!status.configured ? (
-          <InlineNotice tone="warning" title="Aucun envoi automatique">
-            Les invitations et les liens de reinitialisation restent generes et valides,
-            mais doivent etre transmis manuellement : le lien d'invitation s'affiche a
-            la creation, et celui de reinitialisation reste dans le journal du serveur.
+          <InlineNotice tone="info" title="Fonctionne aussi sans e-mail">
+            Les invitations et les liens de reinitialisation restent generes et valides :
+            le lien d'invitation s'affiche a la creation, et un lien de reinitialisation
+            s'obtient depuis la fiche du collaborateur. Configurer un envoi automatique
+            reste optionnel.
           </InlineNotice>
         ) : null}
 
@@ -352,36 +359,83 @@ function EmailCard({
           description="Desactive, la plateforme utilise la configuration d'environnement si elle existe."
         />
 
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Serveur SMTP" error={fields.host} htmlFor="smtp-host">
-            <Input
-              id="smtp-host" value={form.host} placeholder="smtp.exemple.com"
-              onChange={(e) => setForm({ ...form, host: e.target.value })}
+        <Field
+          label="Mode d'envoi"
+          hint="Les fournisseurs par API ne demandent qu'une cle : aucun serveur de messagerie a heberger."
+        >
+          <SegmentedControl
+            value={form.provider}
+            onChange={(value) => setForm({ ...form, provider: value as EmailProvider })}
+            options={[
+              { value: 'smtp', label: 'Relais SMTP' },
+              { value: 'resend', label: 'Resend (API)' },
+              { value: 'brevo', label: 'Brevo (API)' },
+            ]}
+          />
+        </Field>
+
+        {form.provider === 'smtp' ? (
+          <>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Serveur SMTP" error={fields.host} htmlFor="smtp-host">
+                <Input
+                  id="smtp-host" value={form.host} placeholder="smtp.exemple.com"
+                  onChange={(e) => setForm({ ...form, host: e.target.value })}
+                />
+              </Field>
+              <Field label="Port" hint="587 (STARTTLS) ou 465 (TLS implicite)" htmlFor="smtp-port">
+                <Input
+                  id="smtp-port" type="number" min={1} max={65535} value={form.port}
+                  onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+                />
+              </Field>
+              <Field label="Identifiant" htmlFor="smtp-user">
+                <Input
+                  id="smtp-user" value={form.username} autoComplete="off"
+                  onChange={(e) => setForm({ ...form, username: e.target.value })}
+                />
+              </Field>
+              <Field
+                label="Mot de passe"
+                hint={status.hasPassword ? 'Un mot de passe est enregistre. Laissez vide pour le conserver.' : undefined}
+                htmlFor="smtp-password"
+              >
+                <Input
+                  id="smtp-password" type="password" value={password} autoComplete="new-password"
+                  placeholder={status.hasPassword ? '••••••••••••' : ''}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </Field>
+            </div>
+            <Switch
+              checked={form.secure}
+              onChange={(value) => setForm({ ...form, secure: value })}
+              label="TLS implicite (port 465)"
+              description="Laissez desactive pour STARTTLS sur le port 587."
             />
-          </Field>
-          <Field label="Port" hint="587 (STARTTLS) ou 465 (TLS implicite)" htmlFor="smtp-port">
-            <Input
-              id="smtp-port" type="number" min={1} max={65535} value={form.port}
-              onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
-            />
-          </Field>
-          <Field label="Identifiant" htmlFor="smtp-user">
-            <Input
-              id="smtp-user" value={form.username} autoComplete="off"
-              onChange={(e) => setForm({ ...form, username: e.target.value })}
-            />
-          </Field>
+          </>
+        ) : (
           <Field
-            label="Mot de passe"
-            hint={status.hasPassword ? 'Un mot de passe est enregistre. Laissez vide pour le conserver.' : undefined}
-            htmlFor="smtp-password"
+            label="Cle API"
+            error={fields.apiKey}
+            hint={
+              status.hasApiKey
+                ? 'Une cle est enregistree. Laissez vide pour la conserver.'
+                : form.provider === 'resend'
+                  ? 'A creer sur resend.com/api-keys'
+                  : 'A creer sur app.brevo.com/settings/keys/api'
+            }
+            htmlFor="email-api-key"
           >
             <Input
-              id="smtp-password" type="password" value={password} autoComplete="new-password"
-              placeholder={status.hasPassword ? '••••••••••••' : ''}
-              onChange={(e) => setPassword(e.target.value)}
+              id="email-api-key" type="password" value={apiKey} autoComplete="new-password"
+              placeholder={status.hasApiKey ? '••••••••••••' : 'Collez votre cle API'}
+              onChange={(e) => setApiKey(e.target.value)}
             />
           </Field>
+        )}
+
+        <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Nom de l'expediteur" htmlFor="smtp-from-name">
             <Input
               id="smtp-from-name" value={form.fromName}
@@ -395,13 +449,6 @@ function EmailCard({
             />
           </Field>
         </div>
-
-        <Switch
-          checked={form.secure}
-          onChange={(value) => setForm({ ...form, secure: value })}
-          label="TLS implicite (port 465)"
-          description="Laissez desactive pour STARTTLS sur le port 587."
-        />
 
         <InlineNotice
           tone="info"

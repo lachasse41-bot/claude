@@ -45,8 +45,18 @@ const limiterOptions = {
   },
 };
 
-/** Limitation stricte sur les points d'entree sensibles (bruteforce). */
-export const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, ...limiterOptions });
+/**
+ * Limitation des tentatives de connexion.
+ * Seuls les ECHECS sont comptes : c'est ce qui protege du bruteforce. Compter
+ * aussi les connexions reussies bloquerait toute une equipe partageant une
+ * meme adresse IP publique, ce qui est le cas courant en entreprise.
+ */
+export const authLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 20,
+  skipSuccessfulRequests: true,
+  ...limiterOptions,
+});
 export const registerLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 10, ...limiterOptions });
 export const generationLimiter = rateLimit({ windowMs: 60_000, limit: 40, ...limiterOptions });
 export const apiLimiter = rateLimit({ windowMs: 60_000, limit: 600, ...limiterOptions });

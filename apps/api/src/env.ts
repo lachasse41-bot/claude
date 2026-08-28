@@ -117,6 +117,11 @@ export const env = {
   mailFromName: process.env.MAIL_FROM_NAME ?? 'Nova Studio',
   mailReplyTo: process.env.MAIL_REPLY_TO ?? '',
   mailTimeoutMs: int('MAIL_TIMEOUT_MS', 15_000),
+  /**
+   * Redirige les appels aux fournisseurs d'e-mail HTTP vers une autre URL.
+   * Reserve aux tests d'integration : laisser vide en usage normal.
+   */
+  emailApiEndpointOverride: process.env.EMAIL_API_ENDPOINT_OVERRIDE ?? '',
 
   /** Intervalle de sondage des taches en cours (ms). */
   pollIntervalMs: int('POLL_INTERVAL_MS', 5_000),
