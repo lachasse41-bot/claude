@@ -12,12 +12,14 @@ export interface MockKie {
   tasks: Map<string, { polls: number; model: string; input: unknown }>;
   /** Force l'echec de la prochaine tache creee. */
   failNext: boolean;
+  /** Si renseigne, toute creation de tache est refusee avec ce message. */
+  failCreate: string;
   requests: Array<{ path: string; body: unknown }>;
 }
 
 export async function startMockKie(pollsBeforeSuccess = 1): Promise<MockKie> {
   const tasks = new Map<string, { polls: number; model: string; input: unknown }>();
-  const state = { failNext: false } as { failNext: boolean };
+  const state = { failNext: false, failCreate: '' } as { failNext: boolean; failCreate: string };
   const requests: Array<{ path: string; body: unknown }> = [];
 
   const server = http.createServer((req, res) => {
@@ -43,6 +45,10 @@ export async function startMockKie(pollsBeforeSuccess = 1): Promise<MockKie> {
       // Les trois transports de creation de tache exposes par KIE.ai.
       const CREATE_PATHS = ['/api/v1/jobs/createTask', '/api/v1/veo/generate', '/api/v1/generate'];
       if (CREATE_PATHS.includes(url.pathname)) {
+        if (state.failCreate) {
+          res.statusCode = 422;
+          return res.end(JSON.stringify({ code: 422, msg: state.failCreate }));
+        }
         const taskId = `task_${tasks.size + 1}_${state.failNext ? 'fail' : 'ok'}`;
         tasks.set(taskId, {
           polls: 0,
@@ -110,6 +116,8 @@ export async function startMockKie(pollsBeforeSuccess = 1): Promise<MockKie> {
     requests,
     get failNext() { return state.failNext; },
     set failNext(value: boolean) { state.failNext = value; },
+    get failCreate() { return state.failCreate; },
+    set failCreate(value: string) { state.failCreate = value; },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   } as MockKie;
 }

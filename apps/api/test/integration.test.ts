@@ -1179,3 +1179,125 @@ describe("Envoi par API HTTP (sans relais SMTP)", () => {
     assert.ok(res.body.error.fields.apiKey);
   });
 });
+
+describe('Diagnostic des modeles', () => {
+  let adminCookie = '';
+
+  before(async () => {
+    adminCookie = (await api('POST', '/auth/login', {
+      body: { email: 'admin@test.local', password: 'AdminTest123' },
+    })).cookie!;
+  });
+
+  test("l'apercu montre la requete exacte sans rien envoyer", async () => {
+    const before = mock.requests.length;
+    const res = await api('POST', '/admin/models/nano-banana/diagnose', {
+      cookie: adminCookie,
+      body: {},
+    });
+    assert.equal(res.status, 200);
+    assert.equal(mock.requests.length, before, 'aucun appel ne doit partir en apercu');
+
+    const d = res.body.diagnostic;
+    assert.equal(d.transport, 'jobs');
+    assert.equal(d.providerModel, 'google/nano-banana');
+    assert.match(d.request.url, /\/api\/v1\/jobs\/createTask$/);
+    assert.equal(d.request.body.model, 'google/nano-banana');
+    // Le corps reflete exactement ce qui partirait, y compris le nom des champs.
+    assert.equal(d.request.body.input.image_size, '1:1');
+    assert.equal(d.request.body.input.aspect_ratio, undefined);
+    assert.equal(d.live, null);
+  });
+
+  test("la cle API n'apparait jamais dans le diagnostic", async () => {
+    const res = await api('POST', '/admin/models/nano-banana/diagnose', {
+      cookie: adminCookie,
+      body: {},
+    });
+    const serialized = JSON.stringify(res.body);
+    assert.ok(!serialized.includes('test-key'), 'la cle ne doit pas etre exposee');
+    assert.match(res.body.diagnostic.request.headers.Authorization, /^Bearer \*{4}/);
+  });
+
+  test('chaque transport produit la forme de corps qui lui est propre', async () => {
+    const veo = (await api('POST', '/admin/models/veo-3-fast/diagnose', {
+      cookie: adminCookie, body: {},
+    })).body.diagnostic;
+    assert.match(veo.request.url, /\/api\/v1\/veo\/generate$/);
+    assert.equal(veo.request.body.model, 'veo3_fast');
+    assert.equal(veo.request.body.input, undefined, 'le transport veo est a plat');
+
+    const suno = (await api('POST', '/admin/models/suno-music/diagnose', {
+      cookie: adminCookie, body: {},
+    })).body.diagnostic;
+    assert.match(suno.request.url, /\/api\/v1\/generate$/);
+    assert.equal(suno.request.body.customMode, false);
+  });
+
+  test('un test reel soumet une tache et rapporte son acceptation', async () => {
+    const res = await api('POST', '/admin/models/nano-banana/diagnose', {
+      cookie: adminCookie,
+      body: { live: true },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.diagnostic.live.accepted, true);
+    assert.ok(res.body.diagnostic.live.taskId);
+
+    // Aucune generation n'est creee : les credits des collaborateurs sont intacts.
+    const generations = (await api('GET', '/generations?userId=all', { cookie: adminCookie })).body;
+    assert.ok(
+      !generations.items.some((g: any) => g.prompt === 'Test de configuration'),
+      "le diagnostic ne doit pas apparaitre dans l'historique des generations",
+    );
+
+    const activity = (await api('GET', '/admin/activity?action=admin.model_diagnosed', {
+      cookie: adminCookie,
+    })).body;
+    assert.ok(activity.items.length > 0, "le test reel doit etre journalise");
+  });
+
+  test("un refus du fournisseur designe le parametre a corriger", async () => {
+    // Le modele est volontairement pointe vers un identifiant inexistant.
+    await api('PUT', '/admin/models/modele-casse', {
+      cookie: adminCookie,
+      body: {
+        name: 'Modele casse',
+        kind: 'image',
+        providerModel: 'fournisseur/inexistant',
+        outputs: { mode: 'fanout', min: 1, max: 1, default: 1 },
+        credits: { base: 1, perOutput: true },
+        params: [
+          {
+            id: 'prompt', field: 'prompt', label: 'Prompt', group: 'core',
+            type: 'textarea', default: '', maxLength: 500, required: true,
+          },
+        ],
+      },
+    });
+    mock.failCreate = 'Unsupported parameter \'prompt\' for this model';
+
+    const res = await api('POST', '/admin/models/modele-casse/diagnose', {
+      cookie: adminCookie,
+      body: { live: true },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.diagnostic.live.accepted, false);
+    assert.match(res.body.diagnostic.live.message, /Unsupported parameter/);
+    // La piste doit nommer le parametre concerne, pas seulement relayer l'erreur.
+    assert.match(res.body.diagnostic.live.hint, /prompt/);
+
+    mock.failCreate = '';
+    await api('DELETE', '/admin/models/modele-casse', { cookie: adminCookie });
+  });
+
+  test('un collaborateur ne peut pas diagnostiquer un modele', async () => {
+    const collaborateur = (await api('POST', '/auth/login', {
+      body: { email: 'nina@test.local', password: 'NouveauPass123' },
+    })).cookie!;
+    const res = await api('POST', '/admin/models/nano-banana/diagnose', {
+      cookie: collaborateur,
+      body: {},
+    });
+    assert.equal(res.status, 403);
+  });
+});

@@ -1,6 +1,19 @@
 import { useState } from 'react';
-import { AlertTriangle, BookOpen, Plus, RotateCcw, Save, SlidersHorizontal, Trash2 } from 'lucide-react';
+import {
+  AlertTriangle, BookOpen, Plus, RotateCcw, Save, SlidersHorizontal, Stethoscope, Trash2,
+} from 'lucide-react';
 import type { ModelSummary } from '@nova/shared';
+
+/** Rapport de diagnostic renvoye par l'API. */
+interface Diagnostic {
+  modelKey: string;
+  modelName: string;
+  transport: string;
+  providerModel: string;
+  unverifiedFields: string[];
+  request: { method: string; url: string; body: Record<string, unknown> };
+  live: { accepted: boolean; message: string; hint: string | null } | null;
+}
 import { ApiError, api } from '../../lib/api';
 import { useQuery, useQueryClient } from '../../lib/queries';
 import {
@@ -47,6 +60,9 @@ export function AdminModelsPage() {
   const [editing, setEditing] = useState<{ key: string; json: string; isNew: boolean } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ModelSummary | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Diagnostic affiche : requete envoyee au fournisseur et sa reponse. */
+  const [diagnostic, setDiagnostic] = useState<Diagnostic | null>(null);
+  const [diagnosing, setDiagnosing] = useState<string | null>(null);
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['admin-models'],
@@ -121,6 +137,30 @@ export function AdminModelsPage() {
       toast.error('Suppression impossible', err instanceof ApiError ? err.message : undefined);
     } finally {
       setBusy(false);
+    }
+  }
+
+  /**
+   * Montre la requete exacte envoyee au fournisseur pour ce modele.
+   * `live` soumet en plus une tache reelle : cela consomme des credits chez le
+   * fournisseur, jamais ceux d'un collaborateur.
+   */
+  async function diagnose(model: ModelSummary, live: boolean) {
+    setDiagnosing(model.key);
+    try {
+      const response = await api.post<{ diagnostic: Diagnostic }>(
+        `/admin/models/${model.key}/diagnose`,
+        { live },
+      );
+      setDiagnostic(response.diagnostic);
+      if (live) {
+        if (response.diagnostic.live?.accepted) toast.success('Modele accepte par le fournisseur');
+        else toast.error('Modele refuse', response.diagnostic.live?.message);
+      }
+    } catch (err) {
+      toast.error('Diagnostic impossible', err instanceof ApiError ? err.message : undefined);
+    } finally {
+      setDiagnosing(null);
     }
   }
 
@@ -218,7 +258,16 @@ export function AdminModelsPage() {
 
                   <div className="flex items-center gap-2">
                     <Button size="sm" variant="secondary" onClick={() => openEditor(model)}>
-                      Modifier la definition
+                      Modifier
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      icon={<Stethoscope className="size-3.5" />}
+                      loading={diagnosing === model.key}
+                      onClick={() => diagnose(model, false)}
+                    >
+                      Diagnostiquer
                     </Button>
                     {model.docsUrl ? (
                       <a href={model.docsUrl} target="_blank" rel="noreferrer">
@@ -250,6 +299,67 @@ export function AdminModelsPage() {
           />
         </Card>
       )}
+
+      <Modal
+        open={Boolean(diagnostic)}
+        onClose={() => setDiagnostic(null)}
+        size="lg"
+        title={`Diagnostic — ${diagnostic?.modelName ?? ''}`}
+        description="Requete exacte envoyee au fournisseur pour ce modele."
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              loading={diagnosing === diagnostic?.modelKey}
+              onClick={() => {
+                const model = data?.find((m) => m.key === diagnostic?.modelKey);
+                if (model) void diagnose(model, true);
+              }}
+            >
+              Lancer un test reel
+            </Button>
+            <Button onClick={() => setDiagnostic(null)}>Fermer</Button>
+          </>
+        }
+      >
+        {diagnostic ? (
+          <div className="space-y-4">
+            {diagnostic.unverifiedFields.length > 0 ? (
+              <InlineNotice tone="warning" title="Champs a confirmer dans la documentation">
+                {diagnostic.unverifiedFields.join(', ')}
+              </InlineNotice>
+            ) : null}
+
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-fg">
+                Requete
+              </p>
+              <p className="font-mono text-[12px] break-all">
+                {diagnostic.request.method} {diagnostic.request.url}
+              </p>
+              <pre className="mt-2 max-h-72 overflow-auto rounded-[10px] bg-[var(--surface-base)] p-3 font-mono text-[12px] leading-relaxed">
+                {JSON.stringify(diagnostic.request.body, null, 2)}
+              </pre>
+            </div>
+
+            {diagnostic.live ? (
+              <InlineNotice
+                tone={diagnostic.live.accepted ? 'success' : 'danger'}
+                title={diagnostic.live.accepted ? 'Accepte par le fournisseur' : 'Refuse par le fournisseur'}
+              >
+                <p>{diagnostic.live.message}</p>
+                {diagnostic.live.hint ? <p className="mt-1.5">{diagnostic.live.hint}</p> : null}
+              </InlineNotice>
+            ) : (
+              <InlineNotice tone="info">
+                Comparez ce corps de requete a la documentation du modele. Un test reel
+                soumet une tache au fournisseur et consomme ses credits — jamais ceux
+                d'un collaborateur.
+              </InlineNotice>
+            )}
+          </div>
+        ) : null}
+      </Modal>
 
       <Modal
         open={Boolean(editing)}

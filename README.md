@@ -87,6 +87,7 @@ apps/api/src/
 │   ├── files           stockage, controle des uploads, URL signees
 │   ├── activity        journal des actions sensibles
 │   ├── analytics       agregats collaborateur et administrateur
+│   ├── diagnostics     inspection de la requete envoyee au fournisseur
 │   └── worker          reconciliation periodique des taches
 ├── middleware/        authentification, roles, origine, erreurs, quotas
 └── routes/            surface HTTP (aucune logique metier)
@@ -347,6 +348,7 @@ Toutes les routes sont prefixees par `/api`.
 | Workflows | `GET|POST /workflows`, `PUT|DELETE /workflows/:id`, `POST /workflows/:id/run`, `/duplicate`, `GET /workflows/runs` |
 | Administration | `/admin/overview`, `/admin/users`, `/admin/credits`, `/admin/activity`, `/admin/invitations`, `/admin/models`, `/admin/settings`, `/admin/api-configuration`, `/admin/email-configuration` |
 | Liens hors e-mail | `POST /admin/users/:id/password-reset`, `POST /admin/invitations/:id/resend` |
+| Diagnostic | `POST /admin/models/:key/diagnose` (`live` pour un test reel) |
 | Webhook | `POST /webhooks/kie/:generationId` (signee) |
 
 Les erreurs suivent une enveloppe unique et typee :
@@ -360,7 +362,8 @@ Les erreurs suivent une enveloppe unique et typee :
 ## Tests
 
 ```bash
-npm test          # 52 tests d'integration (API, fournisseur IA, SMTP et API e-mail simules)
+npm test          # 58 tests d'integration (API, fournisseur IA, SMTP et API e-mail simules)
+npm run doctor    # inspecte la requete envoyee a KIE.ai pour chaque modele
 npm run typecheck # verification TypeScript des trois paquets
 ```
 
@@ -378,7 +381,9 @@ chiffrement des secrets, echec d'envoi non bloquant, formes de corps propres a
 Resend et Brevo), le fonctionnement complet **sans aucun service d'e-mail**
 (fichier dedie, processus isole), ainsi que deux cas de robustesse :
 desactivation d'un modele pendant une generation en vol et definition de modele
-corrompue en base.
+corrompue en base. Le diagnostic est couvert lui aussi : forme de requete par
+transport, non-divulgation de la cle, absence de generation creee lors d'un
+test reel, et identification du parametre refuse.
 
 Le fournisseur de modeles est simule par un serveur HTTP local reproduisant le
 contrat KIE.ai (`apps/api/test/mockKie.ts`) et la messagerie par un vrai
@@ -406,6 +411,45 @@ En production, verifier imperativement :
 
 ---
 
+## Verifier les modeles avec votre cle
+
+Avant de laisser l'equipe utiliser un modele, comparez ce que la plateforme
+envoie a ce que le fournisseur documente. Deux outils, tous deux sans risque.
+
+**En ligne de commande** — affiche la requete exacte pour chaque modele actif :
+
+```bash
+npm run doctor                        # apercu de tous les modeles (aucun appel, gratuit)
+npm run doctor -- nano-banana         # un seul modele
+npm run doctor -- --live nano-banana  # soumet une vraie tache a ce modele
+npm run doctor -- --live --all        # teste tout le catalogue
+```
+
+L'apercu ne contacte personne : il imprime l'URL, le transport et le corps
+JSON qui partirait. C'est le moyen le plus rapide de reperer un nom de champ
+errone en le comparant a la page de documentation du modele.
+
+`--live` soumet une tache minimale et **consomme des credits chez le
+fournisseur** (jamais ceux d'un collaborateur). Tester tout le catalogue exige
+`--all`, pour eviter une depense involontaire.
+
+**Depuis l'interface** — *Administration > Modeles IA > Diagnostiquer* montre la
+meme requete, avec un bouton pour lancer un test reel. Utile sans acces au
+serveur.
+
+Lorsque le fournisseur refuse, sa reponse brute est relayee et rapprochee du
+parametre concerne :
+
+```
+✗ Unsupported parameter 'cfg_scale' for this model
+  → Le fournisseur mentionne le champ « cfg_scale » (parametre « Adherence au
+    prompt »). Verifiez son nom et ses valeurs sur https://docs.kie.ai/...,
+    puis corrigez-le dans Administration > Modeles IA.
+```
+
+La cle API n'apparait jamais dans un diagnostic : seuls ses quatre derniers
+caracteres sont affiches.
+
 ## Verification restant a faire
 
 Un seul point n'a pas pu etre eprouve depuis cet environnement.
@@ -415,9 +459,10 @@ Un seul point n'a pas pu etre eprouve depuis cet environnement.
 il n'a pas pu etre execute contre l'API de production depuis cet environnement
 (docs et API KIE.ai injoignables ; l'integration est validee contre un
 fournisseur simule reproduisant le contrat). Avant la premiere mise en service,
-lancer une generation par famille de modeles avec la cle de l'organisation et
-ajuster si besoin depuis *Administration > Modeles IA* — **aucun redeploiement
-n'est necessaire**.
+lancer `npm run doctor` puis `npm run doctor -- --live <modele>` avec la cle de
+l'organisation, et ajuster si besoin depuis *Administration > Modeles IA* —
+**aucun redeploiement n'est necessaire**. Voir
+[Verifier les modeles avec votre cle](#verifier-les-modeles-avec-votre-cle).
 
 L'envoi d'e-mails est fonctionnel et valide de bout en bout contre un serveur
 SMTP reel. Les deux fournisseurs par API (Resend, Brevo) sont implementes

@@ -28,6 +28,7 @@ import {
   getApiConfigurationStatus, recordConnectivityCheck, updateApiConfiguration,
 } from '../services/apiConfig.js';
 import { checkConnectivity } from '../providers/kie/client.js';
+import { diagnoseModel } from '../services/diagnostics.js';
 import {
   createUser, deleteUser, getUserFootprint, listUsers, requireUser, setUserRole,
   setUserStatus, toPublicUser,
@@ -526,6 +527,35 @@ adminRouter.delete('/models/:modelKey', asyncRoute(async (req, res) => {
     ip: clientIp(req),
   });
   res.json({ ok: true });
+}));
+
+/**
+ * Diagnostic d'un modele : montre la requete exacte envoyee au fournisseur.
+ * `live: true` soumet reellement une tache minimale — cela consomme des
+ * credits chez le fournisseur, jamais ceux d'un collaborateur.
+ */
+adminRouter.post('/models/:modelKey/diagnose', asyncRoute(async (req, res) => {
+  const { live } = z.object({ live: z.boolean().optional() }).parse(req.body ?? {});
+  const context = actor(req);
+
+  const result = await diagnoseModel({
+    organizationId: context.organizationId,
+    modelKey: req.params.modelKey,
+    live,
+    userId: context.actorUserId,
+  });
+
+  if (live) {
+    logActivity({
+      ...context,
+      action: 'admin.model_diagnosed',
+      entityType: 'model',
+      entityId: result.modelKey,
+      metadata: { accepted: result.live?.accepted ?? false, taskId: result.live?.taskId ?? null },
+      ip: clientIp(req),
+    });
+  }
+  res.json({ diagnostic: result });
 }));
 
 adminRouter.post('/models/restore-catalog', asyncRoute(async (req, res) => {
