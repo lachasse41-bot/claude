@@ -1,0 +1,25 @@
+{
+  "name": "nova-studio",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Plateforme SaaS interne de generation de contenus IA (KIE.ai)",
+  "workspaces": ["packages/*", "apps/*"],
+  "engines": { "node": ">=20.11" },
+  "scripts": {
+    "build:shared": "npm run build -w @nova/shared",
+    "build:api": "npm run build -w @nova/api",
+    "build:web": "npm run build -w @nova/web",
+    "build": "npm run build:shared && npm run build:api && npm run build:web",
+    "dev": "npm run build:shared && concurrently -n api,web -c cyan,magenta \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm run dev -w @nova/api",
+    "dev:web": "npm run dev -w @nova/web",
+    "start": "npm run start -w @nova/api",
+    "seed": "npm run seed -w @nova/api",
+    "typecheck": "npm run typecheck -w @nova/shared && npm run typecheck -w @nova/api && npm run typecheck -w @nova/web",
+    "test": "npm run test -w @nova/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}
