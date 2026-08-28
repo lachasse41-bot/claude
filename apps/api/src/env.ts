@@ -102,6 +102,22 @@ export const env = {
   kieBaseUrl: (process.env.KIE_BASE_URL ?? 'https://api.kie.ai').replace(/\/$/, ''),
   kieRequestTimeoutMs: int('KIE_REQUEST_TIMEOUT_MS', 30_000),
 
+  /**
+   * Service d'envoi d'e-mails (invitations, reinitialisation de mot de passe).
+   * Ces valeurs servent de repli : une configuration saisie depuis l'espace
+   * Administrateur est prioritaire. Sans configuration, les liens restent
+   * fonctionnels mais doivent etre transmis manuellement.
+   */
+  smtpHost: process.env.SMTP_HOST ?? '',
+  smtpPort: int('SMTP_PORT', 587),
+  smtpSecure: bool('SMTP_SECURE', false),
+  smtpUser: process.env.SMTP_USER ?? '',
+  smtpPassword: process.env.SMTP_PASSWORD ?? '',
+  mailFromEmail: process.env.MAIL_FROM_EMAIL ?? '',
+  mailFromName: process.env.MAIL_FROM_NAME ?? 'Nova Studio',
+  mailReplyTo: process.env.MAIL_REPLY_TO ?? '',
+  mailTimeoutMs: int('MAIL_TIMEOUT_MS', 15_000),
+
   /** Intervalle de sondage des taches en cours (ms). */
   pollIntervalMs: int('POLL_INTERVAL_MS', 5_000),
   pollBatchSize: int('POLL_BATCH_SIZE', 20),

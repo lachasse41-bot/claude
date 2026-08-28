@@ -388,6 +388,8 @@ function InviteModal({
   const [credits, setCredits] = useState(500);
   const [fields, setFields] = useState<Record<string, string>>({});
   const [inviteUrl, setInviteUrl] = useState<string | null>(null);
+  /** Resultat de l'envoi automatique, pour adapter le message affiche. */
+  const [delivery, setDelivery] = useState<{ delivered: boolean; reason: string | null } | null>(null);
   const [busy, setBusy] = useState(false);
 
   async function submit() {
@@ -395,17 +397,29 @@ function InviteModal({
     setFields({});
     try {
       if (mode === 'direct') {
-        await api.post('/admin/users', { email, name, password, role, initialCredits: credits });
-        toast.success('Compte cree', `${name} peut se connecter des maintenant.`);
+        const response = await api.post<{ delivery: { delivered: boolean } }>('/admin/users', {
+          email, name, password, role, initialCredits: credits,
+        });
+        toast.success(
+          'Compte cree',
+          response.delivery?.delivered
+            ? `${name} a recu un e-mail de bienvenue. Communiquez-lui son mot de passe provisoire par un autre canal.`
+            : `${name} peut se connecter. Communiquez-lui son mot de passe provisoire.`,
+        );
         onCreated();
         close();
         return;
       }
-      const response = await api.post<{ invitation: Invitation }>('/admin/invitations', {
-        email, role, initialCredits: credits,
-      });
+      const response = await api.post<{
+        invitation: Invitation;
+        delivery: { delivered: boolean; reason: string | null };
+      }>('/admin/invitations', { email, role, initialCredits: credits });
       setInviteUrl(response.invitation.inviteUrl ?? null);
-      toast.success('Invitation creee');
+      setDelivery(response.delivery ?? null);
+      toast.success(
+        response.delivery?.delivered ? 'Invitation envoyee' : 'Invitation creee',
+        response.delivery?.delivered ? `Un e-mail est parti vers ${email}.` : undefined,
+      );
       onCreated();
     } catch (err) {
       if (err instanceof ApiError) {
@@ -418,7 +432,7 @@ function InviteModal({
   }
 
   function close() {
-    setEmail(''); setName(''); setPassword(''); setInviteUrl(null);
+    setEmail(''); setName(''); setPassword(''); setInviteUrl(null); setDelivery(null);
     setFields({}); setCredits(500); setMode('invite');
     onClose();
   }
@@ -452,14 +466,23 @@ function InviteModal({
     >
       {inviteUrl ? (
         <div className="space-y-4">
-          <InlineNotice
-            tone="success"
-            title="Invitation prete"
-            icon={<CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--success)]" />}
-          >
-            Aucun service d e-mail n est configure : transmettez ce lien au collaborateur.
-            Il est valable 14 jours et ne pourra etre utilise qu une seule fois.
-          </InlineNotice>
+          {delivery?.delivered ? (
+            <InlineNotice
+              tone="success"
+              title="Invitation envoyee par e-mail"
+              icon={<CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--success)]" />}
+            >
+              Le collaborateur a recu le lien de creation de compte. Il est valable
+              14 jours et ne pourra etre utilise qu une seule fois. Le lien ci-dessous
+              reste disponible si l e-mail n arrive pas.
+            </InlineNotice>
+          ) : (
+            <InlineNotice tone="warning" title="A transmettre manuellement">
+              {delivery?.reason ?? "L'envoi d'e-mails n'est pas configure."} Transmettez
+              ce lien au collaborateur : il est valable 14 jours et ne pourra etre
+              utilise qu une seule fois.
+            </InlineNotice>
+          )}
           <div className="flex gap-2">
             <Input readOnly value={inviteUrl} className="font-mono text-[12px]" onFocus={(e) => e.target.select()} />
             <Button

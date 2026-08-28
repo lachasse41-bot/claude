@@ -258,13 +258,14 @@ export interface ResetTicket {
   token: string;
   expiresAt: string;
   email: string;
+  name: string;
 }
 
 /**
  * Cree un ticket de reinitialisation.
- * Aucun service d'envoi d'e-mail n'est configure dans cet environnement :
- * le lien est retourne au serveur et journalise. POINT DE BRANCHEMENT :
- * remplacer `deliverResetLink` par l'appel au fournisseur d'e-mails.
+ * Retourne `null` si aucun compte actif ne correspond : l'appelant repond
+ * alors exactement comme en cas de succes, pour ne pas reveler l'existence
+ * du compte.
  */
 export function createPasswordReset(email: string): ResetTicket | null {
   const user = db.prepare('SELECT * FROM users WHERE email_lower = ?')
@@ -278,7 +279,7 @@ export function createPasswordReset(email: string): ResetTicket | null {
     VALUES (?, ?, ?, ?, ?)
   `).run(id('pwr'), user.id, sha256(token), expiresAt, nowIso());
 
-  return { token, expiresAt, email: user.email };
+  return { token, expiresAt, email: user.email, name: user.name };
 }
 
 export function consumePasswordReset(token: string, newPassword: string): UserRow {

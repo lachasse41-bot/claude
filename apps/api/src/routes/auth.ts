@@ -12,6 +12,8 @@ import {
   createSession, previewInvitation, revokeSession,
 } from '../services/auth.js';
 import { logActivity } from '../services/activity.js';
+import { sendEmail } from '../services/mailer.js';
+import { passwordResetEmail } from '../services/emailTemplates.js';
 import { getUserById } from '../services/users.js';
 import {
   clearSessionCookie, emailSchema, nameSchema, passwordSchema, sessionUser, setSessionCookie,
@@ -118,28 +120,56 @@ authRouter.post('/register', registerLimiter, asyncRoute(async (req, res) => {
 
 /* ------------------------ Mot de passe oublie ---------------------- */
 
+/**
+ * Demande de reinitialisation.
+ * La reponse est volontairement identique dans tous les cas : elle ne revele
+ * ni l'existence du compte, ni le succes de l'envoi. Seul le journal serveur
+ * porte le detail.
+ */
 authRouter.post('/forgot-password', authLimiter, asyncRoute(async (req, res) => {
   const { email } = z.object({ email: emailSchema }).parse(req.body);
+  const organizationId = primaryOrganizationId();
   const ticket = createPasswordReset(email);
 
   if (ticket) {
     const resetUrl = `${env.webOrigins[0] ?? env.publicBaseUrl}/reset-password?token=${ticket.token}`;
-    // POINT DE BRANCHEMENT : aucun fournisseur d'e-mail n'est configure.
-    // Brancher ici l'envoi transactionnel (SMTP, Postmark, SES...).
-    logger.info('Lien de reinitialisation genere', { email: ticket.email, resetUrl });
+    const delivery = await sendEmail({
+      organizationId,
+      to: ticket.email,
+      kind: 'password_reset',
+      message: passwordResetEmail({
+        name: ticket.name,
+        resetUrl,
+        expiresAt: ticket.expiresAt,
+      }),
+    });
+
+    if (!delivery.delivered) {
+      // Sans service d'e-mail, le lien reste seulement dans le journal serveur :
+      // un administrateur peut le transmettre. Il n'est jamais renvoye au client
+      // en production, sous peine de permettre la prise de controle d'un compte
+      // a partir de la seule connaissance d'une adresse.
+      logger.warn('Lien de reinitialisation non distribue', {
+        email: ticket.email,
+        reason: delivery.reason,
+        resetUrl,
+      });
+    }
+
     logActivity({
-      organizationId: primaryOrganizationId(),
+      organizationId,
       action: 'auth.password_reset_requested',
       actorEmail: ticket.email,
+      metadata: { emailDelivered: delivery.delivered },
       ip: clientIp(req),
     });
-    if (!env.isProd) {
-      // En developpement, le lien est renvoye pour permettre le test complet
-      // du parcours sans service d'e-mail.
+
+    if (!env.isProd && !delivery.delivered) {
+      // Confort de developpement uniquement : permet de derouler le parcours
+      // complet sans serveur SMTP. Jamais actif en production.
       return res.json({ ok: true, devResetUrl: resetUrl });
     }
   }
-  // Reponse identique qu'un compte existe ou non (pas d'enumeration).
   res.json({ ok: true });
 }));
 

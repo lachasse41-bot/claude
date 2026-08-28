@@ -323,6 +323,34 @@ export interface ApiConfigurationStatus {
   lastCheckMessage: string | null;
 }
 
+export interface EmailConfigurationStatus {
+  /** true => les e-mails sont reellement envoyes. */
+  enabled: boolean;
+  configured: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  fromName: string;
+  fromEmail: string;
+  replyTo: string;
+  /** Indique si les valeurs proviennent des variables d'environnement. */
+  source: 'organization' | 'environment' | 'none';
+  hasPassword: boolean;
+  updatedAt: string | null;
+  updatedByName: string | null;
+  lastCheckAt: string | null;
+  lastCheckStatus: 'ok' | 'error' | null;
+  lastCheckMessage: string | null;
+}
+
+/** Resultat d'un envoi, tel qu'expose a l'interface. */
+export interface EmailDeliveryResult {
+  delivered: boolean;
+  /** Raison lisible lorsque l'envoi n'a pas eu lieu. */
+  reason: string | null;
+}
+
 export interface AdminOverview {
   totals: {
     collaborators: number;

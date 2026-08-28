@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Building2, CheckCircle2, KeyRound, Plug, ShieldAlert, XCircle } from 'lucide-react';
-import type { ApiConfigurationStatus, OrganizationSettings } from '@nova/shared';
+import {
+  Building2, CheckCircle2, KeyRound, Mail, Plug, Send, ShieldAlert, XCircle,
+} from 'lucide-react';
+import type {
+  ApiConfigurationStatus, EmailConfigurationStatus, OrganizationSettings,
+} from '@nova/shared';
 import { ApiError, api } from '../../lib/api';
 import { useQuery } from '../../lib/queries';
 import { useAuth } from '../../context/AuthContext';
@@ -12,6 +16,7 @@ import { formatDateTime } from '../../lib/format';
 interface SettingsResponse {
   organization: { id: string; name: string; settings: OrganizationSettings };
   apiConfiguration: ApiConfigurationStatus;
+  emailConfiguration: EmailConfigurationStatus;
 }
 
 export function AdminSettingsPage() {
@@ -229,7 +234,211 @@ export function AdminSettingsPage() {
             </p>
           </div>
         </Card>
+
+        <EmailCard status={data.emailConfiguration} onSaved={() => void refetch()} />
       </div>
     </>
+  );
+}
+
+/**
+ * Configuration du service d'envoi.
+ * Sans service configure, les invitations et les liens de reinitialisation
+ * restent generes : ils doivent simplement etre transmis a la main.
+ */
+function EmailCard({
+  status, onSaved,
+}: { status: EmailConfigurationStatus; onSaved: () => void }) {
+  const toast = useToast();
+  const [form, setForm] = useState({
+    enabled: status.enabled,
+    host: status.host,
+    port: status.port,
+    secure: status.secure,
+    username: status.username,
+    fromName: status.fromName,
+    fromEmail: status.fromEmail,
+    replyTo: status.replyTo,
+  });
+  const [password, setPassword] = useState('');
+  const [testTo, setTestTo] = useState('');
+  const [fields, setFields] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => {
+    setForm({
+      enabled: status.enabled,
+      host: status.host,
+      port: status.port,
+      secure: status.secure,
+      username: status.username,
+      fromName: status.fromName,
+      fromEmail: status.fromEmail,
+      replyTo: status.replyTo,
+    });
+  }, [status]);
+
+  async function save() {
+    setSaving(true);
+    setFields({});
+    try {
+      await api.put('/admin/email-configuration', {
+        ...form,
+        password: password.trim() ? password : undefined,
+      });
+      setPassword('');
+      toast.success('Configuration enregistree');
+      onSaved();
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setFields(err.fields);
+        toast.error(err.title, err.message);
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function test() {
+    setTesting(true);
+    try {
+      const response = await api.post<{
+        result: { ok: boolean; message: string };
+        delivery: { delivered: boolean; reason: string | null } | null;
+      }>('/admin/email-configuration/test', { sendTo: testTo.trim() || undefined });
+
+      if (!response.result.ok) toast.error('Connexion impossible', response.result.message);
+      else if (response.delivery?.delivered) toast.success('E-mail de test envoye', `Destinataire : ${testTo}`);
+      else if (response.delivery) toast.error('Envoi impossible', response.delivery.reason ?? undefined);
+      else toast.success('Connexion etablie', response.result.message);
+      onSaved();
+    } catch (err) {
+      toast.error('Test impossible', err instanceof ApiError ? err.message : undefined);
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <Card className="lg:col-span-2">
+      <CardHeader
+        title="Envoi des e-mails"
+        description="Invitations et reinitialisations de mot de passe"
+        icon={<Mail className="size-4" />}
+        action={
+          status.configured ? (
+            <Badge tone="success" icon={<CheckCircle2 className="size-3" />}>
+              {status.source === 'environment' ? "Via l'environnement" : 'Configuree'}
+            </Badge>
+          ) : (
+            <Badge tone="warning" icon={<XCircle className="size-3" />}>Non configuree</Badge>
+          )
+        }
+      />
+      <div className="space-y-4 p-5">
+        {!status.configured ? (
+          <InlineNotice tone="warning" title="Aucun envoi automatique">
+            Les invitations et les liens de reinitialisation restent generes et valides,
+            mais doivent etre transmis manuellement : le lien d'invitation s'affiche a
+            la creation, et celui de reinitialisation reste dans le journal du serveur.
+          </InlineNotice>
+        ) : null}
+
+        <Switch
+          checked={form.enabled}
+          onChange={(value) => setForm({ ...form, enabled: value })}
+          label="Envoyer les e-mails depuis cette organisation"
+          description="Desactive, la plateforme utilise la configuration d'environnement si elle existe."
+        />
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Serveur SMTP" error={fields.host} htmlFor="smtp-host">
+            <Input
+              id="smtp-host" value={form.host} placeholder="smtp.exemple.com"
+              onChange={(e) => setForm({ ...form, host: e.target.value })}
+            />
+          </Field>
+          <Field label="Port" hint="587 (STARTTLS) ou 465 (TLS implicite)" htmlFor="smtp-port">
+            <Input
+              id="smtp-port" type="number" min={1} max={65535} value={form.port}
+              onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+            />
+          </Field>
+          <Field label="Identifiant" htmlFor="smtp-user">
+            <Input
+              id="smtp-user" value={form.username} autoComplete="off"
+              onChange={(e) => setForm({ ...form, username: e.target.value })}
+            />
+          </Field>
+          <Field
+            label="Mot de passe"
+            hint={status.hasPassword ? 'Un mot de passe est enregistre. Laissez vide pour le conserver.' : undefined}
+            htmlFor="smtp-password"
+          >
+            <Input
+              id="smtp-password" type="password" value={password} autoComplete="new-password"
+              placeholder={status.hasPassword ? '••••••••••••' : ''}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </Field>
+          <Field label="Nom de l'expediteur" htmlFor="smtp-from-name">
+            <Input
+              id="smtp-from-name" value={form.fromName}
+              onChange={(e) => setForm({ ...form, fromName: e.target.value })}
+            />
+          </Field>
+          <Field label="Adresse d'expedition" error={fields.fromEmail} htmlFor="smtp-from-email">
+            <Input
+              id="smtp-from-email" type="email" value={form.fromEmail} placeholder="nova@exemple.com"
+              onChange={(e) => setForm({ ...form, fromEmail: e.target.value })}
+            />
+          </Field>
+        </div>
+
+        <Switch
+          checked={form.secure}
+          onChange={(value) => setForm({ ...form, secure: value })}
+          label="TLS implicite (port 465)"
+          description="Laissez desactive pour STARTTLS sur le port 587."
+        />
+
+        <InlineNotice
+          tone="info"
+          title="Le mot de passe ne quitte jamais le serveur"
+          icon={<ShieldAlert className="mt-0.5 size-4 shrink-0 text-[var(--info)]" />}
+        >
+          Il est chiffre (AES-256-GCM) avant stockage. Aucun mot de passe de compte
+          n'est jamais envoye par e-mail.
+        </InlineNotice>
+
+        {status.lastCheckAt ? (
+          <p className="text-[12px] text-muted-fg">
+            Dernier test : {formatDateTime(status.lastCheckAt)} —{' '}
+            <span className={status.lastCheckStatus === 'ok' ? 'text-[var(--success)]' : 'text-[var(--danger)]'}>
+              {status.lastCheckMessage}
+            </span>
+          </p>
+        ) : null}
+
+        <div className="flex flex-wrap items-end gap-2">
+          <Button loading={saving} icon={<KeyRound className="size-4" />} onClick={save}>
+            Enregistrer
+          </Button>
+          <div className="flex items-end gap-2">
+            <Field label="Envoyer un test a" htmlFor="smtp-test">
+              <Input
+                id="smtp-test" type="email" value={testTo} placeholder="vous@entreprise.com"
+                className="min-w-[220px]"
+                onChange={(e) => setTestTo(e.target.value)}
+              />
+            </Field>
+            <Button variant="secondary" loading={testing} icon={<Send className="size-4" />} onClick={test}>
+              Tester
+            </Button>
+          </div>
+        </div>
+      </div>
+    </Card>
   );
 }

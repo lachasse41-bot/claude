@@ -53,6 +53,7 @@ npm run seed
 | `PUBLIC_BASE_URL` | URL publique de l'API. **Doit etre joignable depuis Internet** : KIE.ai telecharge les images de reference via des URL signees et appelle le webhook de callback. En local, utiliser un tunnel. |
 | `WEB_ORIGIN` | Origine(s) autorisee(s) du frontend (protection CSRF + CORS). |
 | `KIE_API_KEY` | Cle API par defaut. Elle peut aussi etre saisie depuis *Administration > Parametres*, auquel cas elle est chiffree en base et prioritaire. |
+| `SMTP_HOST`, `MAIL_FROM_EMAIL` | Envoi des e-mails. Optionnel : sans configuration, les liens d'invitation et de reinitialisation restent valides mais se transmettent a la main. Configurable aussi depuis l'espace Administrateur. |
 | `COOKIE_SECURE` | `true` obligatoire derriere HTTPS. |
 
 La liste complete est documentee dans [`.env.example`](.env.example).
@@ -74,6 +75,7 @@ apps/api/src/
 ├── providers/kie/     Client HTTP KIE.ai (seul endroit qui parle au fournisseur)
 ├── services/
 │   ├── auth            sessions, invitations, reinitialisation de mot de passe
+│   ├── mailer          envoi SMTP + modeles de messages transactionnels
 │   ├── users           comptes, roles, statuts, suppression
 │   ├── credits         grand livre (reservation, debit, remboursement)
 │   ├── models          catalogue, validation des definitions
@@ -203,6 +205,33 @@ complet reste dans le journal serveur et dans `generations.error_detail_json`.
 
 ---
 
+## Envoi des e-mails
+
+Deux messages transactionnels sont envoyes : l'**invitation** d'un
+collaborateur et la **reinitialisation de mot de passe** (plus un message
+d'ouverture de compte lors d'une creation directe, et un e-mail de test).
+
+La configuration SMTP se fait par variables d'environnement ou depuis
+*Administration > Parametres* (le mot de passe est chiffre AES-256-GCM et
+n'est jamais renvoye au client). Un bouton verifie la connexion et envoie un
+message de test.
+
+Regles appliquees :
+
+- **L'envoi n'est jamais bloquant.** Une invitation reste creee et valide meme
+  si l'e-mail echoue ; l'interface affiche alors le lien a transmettre.
+- **Sans service configure**, la plateforme reste pleinement utilisable : le
+  lien d'invitation s'affiche a la creation, celui de reinitialisation est
+  ecrit dans le journal serveur.
+- **Aucun mot de passe n'est jamais envoye par e-mail**, y compris lors d'une
+  creation de compte par un administrateur.
+- La reponse a « mot de passe oublie » est **identique dans tous les cas** :
+  elle ne revele ni l'existence du compte, ni le resultat de l'envoi. Le lien
+  n'est renvoye au client qu'en developpement, et uniquement si aucun service
+  d'e-mail n'est configure.
+- Les adresses sont validees avant envoi (protection contre l'injection
+  d'en-tetes), et chaque envoi est journalise.
+
 ## Systeme de credits
 
 Toute variation de solde passe par une seule fonction transactionnelle
@@ -304,7 +333,7 @@ Les erreurs suivent une enveloppe unique et typee :
 ## Tests
 
 ```bash
-npm test          # 31 tests d'integration (API reelle + fournisseur simule)
+npm test          # 39 tests d'integration (API, fournisseur et SMTP simules)
 npm run typecheck # verification TypeScript des trois paquets
 ```
 
@@ -316,11 +345,16 @@ insuffisant, l'isolation stricte entre collaborateurs, la galerie, les
 workflows multi-etapes, la desactivation et la suppression de comptes,
 l'ajout d'un modele a chaud, la non-divulgation de la cle API, les trois
 transports provider, les sorties multiples en une seule tache, les parametres
-conditionnels, ainsi que deux cas de robustesse : desactivation d'un modele
-pendant une generation en vol et definition de modele corrompue en base.
+conditionnels, l'envoi reel des e-mails (invitation et reinitialisation
+jusqu'a la connexion effective, absence de mot de passe dans les messages,
+chiffrement du mot de passe SMTP, echec d'envoi non bloquant), ainsi que deux
+cas de robustesse : desactivation d'un modele pendant une generation en vol et
+definition de modele corrompue en base.
 
-Le fournisseur est simule par un serveur HTTP local reproduisant le contrat
-KIE.ai (`apps/api/test/mockKie.ts`) : aucun credit reel n'est consomme.
+Le fournisseur de modeles est simule par un serveur HTTP local reproduisant le
+contrat KIE.ai (`apps/api/test/mockKie.ts`) et la messagerie par un vrai
+serveur SMTP local (`apps/api/test/mockSmtp.ts`) : aucun credit reel n'est
+consomme et aucun e-mail ne sort.
 
 ---
 
@@ -343,26 +377,23 @@ En production, verifier imperativement :
 
 ---
 
-## Points de branchement restants
+## Verification restant a faire
 
-Ces elements dependent de services externes non disponibles dans cet
-environnement. L'interface et l'abstraction sont en place ; seul le connecteur
-reste a brancher.
+Un seul point n'a pas pu etre eprouve depuis cet environnement.
 
-1. **Envoi d'e-mails** — invitations et reinitialisations de mot de passe
-   generent un lien fonctionnel, actuellement remis a l'administrateur (ou
-   journalise) au lieu d'etre envoye. Point de branchement :
-   `apps/api/src/routes/auth.ts` (`forgot-password`) et
-   `apps/api/src/services/auth.ts` (`createInvitation`).
-
-2. **Cle API et quotas** — le catalogue par defaut a ete aligne sur les
+**Execution reelle contre KIE.ai** — le catalogue par defaut a ete aligne sur les
    identifiants et noms de champs reels du fournisseur (voir ci-dessous), mais
-   il n'a pas pu etre execute contre l'API de production depuis cet
-   environnement (docs et API KIE.ai injoignables ; l'integration est validee
-   contre un fournisseur simule reproduisant le contrat). Avant la premiere
-   mise en service, lancer une generation par famille de modeles avec la cle
-   de l'organisation et ajuster si besoin depuis *Administration > Modeles IA*
-   — **aucun redeploiement n'est necessaire**.
+il n'a pas pu etre execute contre l'API de production depuis cet environnement
+(docs et API KIE.ai injoignables ; l'integration est validee contre un
+fournisseur simule reproduisant le contrat). Avant la premiere mise en service,
+lancer une generation par famille de modeles avec la cle de l'organisation et
+ajuster si besoin depuis *Administration > Modeles IA* — **aucun redeploiement
+n'est necessaire**.
+
+L'envoi d'e-mails, lui, est fonctionnel : il est valide de bout en bout contre
+un serveur SMTP reel (invitation recue, compte cree depuis le lien ; lien de
+reinitialisation recu, mot de passe change, reconnexion effective). Il reste a
+renseigner les identifiants de votre relais SMTP.
 
 ### Ecarts corriges lors de l'alignement du catalogue
 

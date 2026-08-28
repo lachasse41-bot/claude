@@ -298,3 +298,25 @@ CREATE TABLE IF NOT EXISTS api_configurations (
   updated_at          TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_apiconfig_org ON api_configurations(organization_id, provider);
+
+-- Configuration du service d'envoi d'e-mails (SMTP), par organisation.
+-- Le mot de passe est chiffre au repos, comme la cle API du fournisseur IA.
+CREATE TABLE IF NOT EXISTS email_configurations (
+  id                  TEXT PRIMARY KEY,
+  organization_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  enabled             INTEGER NOT NULL DEFAULT 0,
+  host                TEXT NOT NULL DEFAULT '',
+  port                INTEGER NOT NULL DEFAULT 587,
+  secure              INTEGER NOT NULL DEFAULT 0,   -- TLS implicite (port 465)
+  username            TEXT NOT NULL DEFAULT '',
+  password_encrypted  TEXT,                         -- AES-256-GCM, jamais renvoye
+  from_name           TEXT NOT NULL DEFAULT '',
+  from_email          TEXT NOT NULL DEFAULT '',
+  reply_to            TEXT NOT NULL DEFAULT '',
+  last_check_at       TEXT,
+  last_check_status   TEXT,
+  last_check_message  TEXT,
+  updated_by          TEXT REFERENCES users(id) ON DELETE SET NULL,
+  updated_at          TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_emailconfig_org ON email_configurations(organization_id);

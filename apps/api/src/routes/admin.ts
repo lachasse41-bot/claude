@@ -13,7 +13,15 @@ import { deleteStoredFiles } from '../services/files.js';
 import {
   deleteModel, listModels, restoreCatalog, setModelEnabled, upsertModel,
 } from '../services/models.js';
-import { getOrganization, renameOrganization, updateSettings } from '../services/organizations.js';
+import { getOrganization, getSettings, renameOrganization, updateSettings } from '../services/organizations.js';
+import { sendEmail, verifySmtp, resetTransporters } from '../services/mailer.js';
+import {
+  accountCreatedEmail, invitationEmail, testEmail,
+} from '../services/emailTemplates.js';
+import {
+  getEmailConfigurationStatus, recordEmailCheck, updateEmailConfiguration,
+} from '../services/emailConfig.js';
+import { env } from '../env.js';
 import {
   getApiConfigurationStatus, recordConnectivityCheck, updateApiConfiguration,
 } from '../services/apiConfig.js';
@@ -120,6 +128,20 @@ adminRouter.post('/users', asyncRoute(async (req, res) => {
     initialCredits: input.initialCredits,
     actorUserId: context.actorUserId,
   });
+  // Aucun mot de passe n'est jamais transmis par e-mail : le message annonce
+  // simplement l'ouverture du compte et l'adresse de connexion.
+  const delivery = await sendEmail({
+    organizationId: context.organizationId,
+    to: created.email,
+    kind: 'account_created',
+    message: accountCreatedEmail({
+      name: created.name,
+      organizationName: getOrganization(context.organizationId).name,
+      loginUrl: `${env.webOrigins[0] ?? env.publicBaseUrl}/connexion`,
+      credits: input.initialCredits ?? getSettings(context.organizationId).defaultCollaboratorCredits,
+    }),
+  });
+
   logActivity({
     ...context,
     targetUserId: created.id,
@@ -127,10 +149,14 @@ adminRouter.post('/users', asyncRoute(async (req, res) => {
     action: 'admin.user_created',
     entityType: 'user',
     entityId: created.id,
-    metadata: { role: created.role, initialCredits: input.initialCredits ?? null },
+    metadata: {
+      role: created.role,
+      initialCredits: input.initialCredits ?? null,
+      emailDelivered: delivery.delivered,
+    },
     ip: clientIp(req),
   });
-  res.status(201).json({ user: created });
+  res.status(201).json({ user: created, delivery });
 }));
 
 adminRouter.get('/users/:userId', asyncRoute(async (req, res) => {
@@ -293,15 +319,32 @@ adminRouter.post('/invitations', asyncRoute(async (req, res) => {
     initialCredits: input.initialCredits,
     createdBy: context.actorUserId,
   });
+
+  // L'envoi est tente mais n'est pas bloquant : l'invitation reste valable et
+  // son lien est renvoye a l'administrateur pour transmission manuelle.
+  const delivery = await sendEmail({
+    organizationId: context.organizationId,
+    to: invitation.email,
+    kind: 'invitation',
+    message: invitationEmail({
+      organizationName: getOrganization(context.organizationId).name,
+      inviterName: context.actorName,
+      inviteUrl: invitation.inviteUrl!,
+      role: invitation.role,
+      expiresAt: invitation.expiresAt,
+      credits: invitation.initialCredits,
+    }),
+  });
+
   logActivity({
     ...context,
     action: 'admin.invitation_created',
     entityType: 'invitation',
     entityId: invitation.id,
-    metadata: { email: invitation.email, role: invitation.role },
+    metadata: { email: invitation.email, role: invitation.role, emailDelivered: delivery.delivered },
     ip: clientIp(req),
   });
-  res.status(201).json({ invitation });
+  res.status(201).json({ invitation, delivery });
 }));
 
 adminRouter.delete('/invitations/:invitationId', asyncRoute(async (req, res) => {
@@ -428,6 +471,7 @@ adminRouter.get('/settings', asyncRoute(async (req, res) => {
   res.json({
     organization: getOrganization(organizationId),
     apiConfiguration: getApiConfigurationStatus(organizationId),
+    emailConfiguration: getEmailConfigurationStatus(organizationId),
   });
 }));
 
@@ -483,6 +527,91 @@ adminRouter.put('/api-configuration', asyncRoute(async (req, res) => {
     ip: clientIp(req),
   });
   res.json({ apiConfiguration: status });
+}));
+
+/* --------------------- Configuration des e-mails ------------------- */
+
+const emailConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  host: z.string().max(200).optional(),
+  port: z.number().int().min(1).max(65535).optional(),
+  secure: z.boolean().optional(),
+  username: z.string().max(200).optional(),
+  password: z.string().max(300).nullable().optional(),
+  fromName: z.string().max(80).optional(),
+  fromEmail: z.string().max(200).optional(),
+  replyTo: z.string().max(200).optional(),
+});
+
+/**
+ * Enregistrement des parametres SMTP.
+ * Le mot de passe est chiffre avant stockage et n'est jamais renvoye au client.
+ */
+adminRouter.put('/email-configuration', asyncRoute(async (req, res) => {
+  const input = emailConfigSchema.parse(req.body);
+  const context = actor(req);
+
+  for (const [field, value] of Object.entries({ fromEmail: input.fromEmail, replyTo: input.replyTo })) {
+    if (value && !/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(value)) {
+      throw badRequest('Adresse e-mail invalide.', { [field]: 'Adresse e-mail invalide.' });
+    }
+  }
+  if (input.enabled && !(input.host ?? '').trim() && !getEmailConfigurationStatus(context.organizationId).host) {
+    throw badRequest("Renseignez le serveur SMTP avant d'activer l'envoi.", {
+      host: 'Serveur SMTP obligatoire.',
+    });
+  }
+
+  const status = updateEmailConfiguration(context.organizationId, input, context.actorUserId);
+  // La configuration a change : les connexions en cache ne sont plus valables.
+  resetTransporters();
+
+  logActivity({
+    ...context,
+    action: 'admin.email_configuration_updated',
+    entityType: 'email_configuration',
+    entityId: 'smtp',
+    metadata: { enabled: status.enabled, host: status.host, port: status.port },
+    ip: clientIp(req),
+  });
+  res.json({ emailConfiguration: status });
+}));
+
+/** Verifie la connexion SMTP, et envoie un message de test si demande. */
+adminRouter.post('/email-configuration/test', asyncRoute(async (req, res) => {
+  const { sendTo } = z.object({ sendTo: z.string().max(200).optional() }).parse(req.body ?? {});
+  const context = actor(req);
+
+  const check = await verifySmtp(context.organizationId);
+  recordEmailCheck(context.organizationId, check.ok ? 'ok' : 'error', check.message);
+
+  let delivery = null;
+  if (check.ok && sendTo) {
+    delivery = await sendEmail({
+      organizationId: context.organizationId,
+      to: sendTo,
+      kind: 'test',
+      message: testEmail({
+        organizationName: getOrganization(context.organizationId).name,
+        actorName: context.actorName,
+      }),
+    });
+  }
+
+  logActivity({
+    ...context,
+    action: 'admin.email_configuration_tested',
+    entityType: 'email_configuration',
+    entityId: 'smtp',
+    metadata: { ok: check.ok, sentTo: sendTo ?? null },
+    ip: clientIp(req),
+  });
+
+  res.json({
+    result: check,
+    delivery,
+    emailConfiguration: getEmailConfigurationStatus(context.organizationId),
+  });
 }));
 
 adminRouter.post('/api-configuration/test', asyncRoute(async (req, res) => {

@@ -6,6 +6,7 @@ import test, { after, before, describe } from 'node:test';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { startMockKie, PNG, type MockKie } from './mockKie.js';
+import { extractLink, startMockSmtp, type MockSmtp } from './mockSmtp.js';
 
 /* Isolation complete : base et stockage temporaires, provider simule. */
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nova-test-'));
@@ -20,6 +21,7 @@ process.env.WORKER_ENABLED = 'false';
 process.env.POLL_INTERVAL_MS = '1';
 
 let mock: MockKie;
+let smtp: MockSmtp;
 let server: Server;
 let baseUrl: string;
 let tick: () => Promise<void>;
@@ -54,6 +56,15 @@ before(async () => {
   process.env.KIE_BASE_URL = mock.url;
   process.env.KIE_API_KEY = 'test-key';
 
+  // Service d'envoi d'e-mails simule, configure par variables d'environnement
+  // (le chemin « configuration d'organisation » est teste separement).
+  smtp = await startMockSmtp();
+  process.env.SMTP_HOST = '127.0.0.1';
+  process.env.SMTP_PORT = String(smtp.port);
+  process.env.SMTP_SECURE = 'false';
+  process.env.MAIL_FROM_EMAIL = 'nova@test.local';
+  process.env.MAIL_FROM_NAME = 'Nova Studio';
+
   const { createApp } = await import('../src/app.js');
   const { bootstrap } = await import('../src/db/bootstrap.js');
   const worker = await import('../src/services/worker.js');
@@ -69,6 +80,9 @@ before(async () => {
 
 after(async () => {
   server?.close();
+  const { resetTransporters } = await import('../src/services/mailer.js');
+  resetTransporters();
+  await smtp?.close();
   await mock?.close();
   fs.rmSync(tmp, { recursive: true, force: true });
 });
@@ -795,5 +809,186 @@ describe('Transports provider', () => {
     assert.equal(typeof input.duration, 'string');
     // Le cout double avec la duree, conformement au multiplicateur declare.
     assert.ok(created.body.creditCost >= 50);
+  });
+});
+
+describe('Envoi des e-mails', () => {
+  let adminCookie = '';
+
+  before(async () => {
+    adminCookie = (await api('POST', '/auth/login', {
+      body: { email: 'admin@test.local', password: 'AdminTest123' },
+    })).cookie!;
+  });
+
+  /** Attend qu'un message destine a `to` arrive dans la boite de test. */
+  async function waitForEmail(to: string, attempts = 40): Promise<any> {
+    for (let i = 0; i < attempts; i += 1) {
+      const found = smtp.messages.find((m) => m.to.includes(to));
+      if (found) return found;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`Aucun e-mail recu pour ${to}`);
+  }
+
+  test("une invitation part par e-mail avec un lien utilisable", async () => {
+    const created = await api('POST', '/admin/invitations', {
+      cookie: adminCookie,
+      body: { email: 'nina@test.local', role: 'collaborator', initialCredits: 300 },
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.delivery.delivered, true);
+
+    const mail = await waitForEmail('nina@test.local');
+    assert.equal(mail.from, 'nova@test.local');
+    assert.match(mail.subject, /Rejoignez/);
+
+    // Le lien contenu dans l'e-mail doit reellement permettre l'inscription.
+    const link = extractLink(mail.raw, '/register');
+    assert.ok(link, "l'e-mail doit contenir le lien d'inscription");
+    const token = new URL(link!).searchParams.get('token')!;
+    assert.ok(token.length > 10);
+
+    const preview = await api('GET', `/auth/invitation?token=${encodeURIComponent(token)}`);
+    assert.equal(preview.status, 200);
+    assert.equal(preview.body.invitation.email, 'nina@test.local');
+
+    const registered = await api('POST', '/auth/register', {
+      body: { token, name: 'Nina Roux', password: 'Motdepasse12' },
+    });
+    assert.equal(registered.status, 201);
+    assert.equal(registered.body.user.credits.balance, 300);
+  });
+
+  test('la demande de mot de passe oublie envoie un lien fonctionnel', async () => {
+    const before = smtp.messages.length;
+    const asked = await api('POST', '/auth/forgot-password', { body: { email: 'nina@test.local' } });
+    assert.equal(asked.status, 200);
+    // Aucun lien n'est renvoye au client des lors que l'e-mail est parti.
+    assert.equal(asked.body.devResetUrl, undefined);
+
+    const mail = smtp.messages.slice(before).find((m) => m.to.includes('nina@test.local'))
+      ?? (await waitForEmail('nina@test.local'));
+    const link = extractLink(mail.raw, '/reset-password');
+    assert.ok(link, "l'e-mail doit contenir le lien de reinitialisation");
+    const token = new URL(link!).searchParams.get('token')!;
+
+    const reset = await api('POST', '/auth/reset-password', {
+      body: { token, password: 'NouveauPass123' },
+    });
+    assert.equal(reset.status, 200);
+
+    const login = await api('POST', '/auth/login', {
+      body: { email: 'nina@test.local', password: 'NouveauPass123' },
+    });
+    assert.equal(login.status, 200);
+  });
+
+  test("une adresse inconnue ne declenche aucun envoi et repond a l'identique", async () => {
+    const before = smtp.messages.length;
+    const res = await api('POST', '/auth/forgot-password', {
+      body: { email: 'personne@test.local' },
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { ok: true });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(smtp.messages.length, before, "aucun e-mail ne doit partir");
+  });
+
+  test("un echec d'envoi ne compromet pas la creation de l'invitation", async () => {
+    smtp.rejectAll = true;
+    try {
+      const created = await api('POST', '/admin/invitations', {
+        cookie: adminCookie,
+        body: { email: 'hugo@test.local', role: 'collaborator' },
+      });
+      // L'invitation existe malgre l'echec, et son lien reste exploitable.
+      assert.equal(created.status, 201);
+      assert.equal(created.body.delivery.delivered, false);
+      assert.ok(created.body.delivery.reason);
+      assert.ok(created.body.invitation.inviteUrl);
+
+      const token = created.body.invitation.inviteUrl.split('token=')[1];
+      const preview = await api('GET', `/auth/invitation?token=${encodeURIComponent(token)}`);
+      assert.equal(preview.status, 200);
+    } finally {
+      smtp.rejectAll = false;
+    }
+  });
+
+  test("aucun mot de passe n'est transmis dans l'e-mail de creation de compte", async () => {
+    const created = await api('POST', '/admin/users', {
+      cookie: adminCookie,
+      body: {
+        email: 'marc@test.local',
+        name: 'Marc Leroy',
+        password: 'ProvisoirE123',
+        role: 'collaborator',
+        initialCredits: 100,
+      },
+    });
+    assert.equal(created.status, 201);
+
+    const mail = await waitForEmail('marc@test.local');
+    assert.ok(!mail.raw.includes('ProvisoirE123'), "le mot de passe ne doit jamais figurer dans l'e-mail");
+    assert.match(mail.subject, /acces/i);
+  });
+
+  test('le mot de passe SMTP est chiffre et jamais renvoye', async () => {
+    const saved = await api('PUT', '/admin/email-configuration', {
+      cookie: adminCookie,
+      body: {
+        enabled: true,
+        host: '127.0.0.1',
+        port: smtp.port,
+        secure: false,
+        username: 'nova',
+        password: 'motdepasse-smtp-secret',
+        fromName: 'Nova Studio',
+        fromEmail: 'nova@test.local',
+      },
+    });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.emailConfiguration.hasPassword, true);
+    assert.ok(!JSON.stringify(saved.body).includes('motdepasse-smtp-secret'));
+
+    const settings = await api('GET', '/admin/settings', { cookie: adminCookie });
+    assert.ok(!JSON.stringify(settings.body).includes('motdepasse-smtp-secret'));
+    assert.equal(settings.body.emailConfiguration.source, 'organization');
+
+    // La valeur stockee en base est bien chiffree.
+    const { db } = await import('../src/db/index.js');
+    const stored = db.prepare('SELECT password_encrypted FROM email_configurations LIMIT 1')
+      .get() as { password_encrypted: string };
+    assert.ok(stored.password_encrypted.startsWith('v1.'));
+    assert.ok(!stored.password_encrypted.includes('motdepasse-smtp-secret'));
+  });
+
+  test('le test de configuration envoie un message de verification', async () => {
+    const before = smtp.messages.length;
+    const res = await api('POST', '/admin/email-configuration/test', {
+      cookie: adminCookie,
+      body: { sendTo: 'admin@test.local' },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.result.ok, true);
+    assert.equal(res.body.delivery.delivered, true);
+    assert.equal(res.body.emailConfiguration.lastCheckStatus, 'ok');
+    assert.ok(smtp.messages.length > before);
+  });
+
+  test("l'envoi peut etre desactive sans perdre les parametres", async () => {
+    await api('PUT', '/admin/email-configuration', {
+      cookie: adminCookie,
+      body: { enabled: false },
+    });
+    const status = (await api('GET', '/admin/settings', { cookie: adminCookie })).body
+      .emailConfiguration;
+    assert.equal(status.enabled, false);
+    assert.equal(status.host, '127.0.0.1', 'les parametres restent enregistres');
+    // Le repli par variables d'environnement reste actif.
+    assert.equal(status.source, 'environment');
+
+    await api('PUT', '/admin/email-configuration', { cookie: adminCookie, body: { enabled: true } });
   });
 });
